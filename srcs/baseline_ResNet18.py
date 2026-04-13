@@ -457,7 +457,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--split-base-root",
         type=Path,
-        default=PROJECT_ROOT / "data" / "splited_data",
+        default=PROJECT_ROOT / "dataset" / "splited_data",
         help="Directory containing train/, val/, and test/ split folders.",
     )
     parser.add_argument(
@@ -577,11 +577,11 @@ def build_argparser() -> argparse.ArgumentParser:
         default=0.1,
         help="Maximum std-based intensity shift used by RandStdShiftIntensityd.",
     )
-    parser.add_argument("--batch-size", type=int, default=32, help="Mini-batch size.")
+    parser.add_argument("--batch-size", type=int, default=16, help="Mini-batch size.")
     parser.add_argument("--epochs", type=int, default=200, help="Training epochs.")
     parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay.")
-    parser.add_argument("--num-workers", type=int, default=16, help="DataLoader workers.")
+    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers.")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Global random seed.")
     parser.add_argument(
         "--pretrained",
@@ -704,6 +704,7 @@ def build_datasets(args: argparse.Namespace) -> Dict[str, HabitatIDHBlockDataset
     transforms = build_monai_block_transforms(
         config=augment_config,
         has_mask=has_mask,
+        spatial_size=(args.resize_height, args.resize_width),
     )
 
     datasets: Dict[str, HabitatIDHBlockDataset] = {}

@@ -11,6 +11,8 @@ from typing import Dict
 import numpy as np
 import torch
 
+from typing import Sequence, Union
+
 try:
     from monai.transforms import (
         Compose,
@@ -19,6 +21,7 @@ try:
         RandFlipd,
         RandScaleIntensityd,
         RandStdShiftIntensityd,
+        Resized,
     )
 except ImportError as exc:  # pragma: no cover - exercised only when MONAI is missing.
     Compose = None
@@ -27,6 +30,7 @@ except ImportError as exc:  # pragma: no cover - exercised only when MONAI is mi
     RandFlipd = None
     RandScaleIntensityd = None
     RandStdShiftIntensityd = None
+    Resized = None
     _MONAI_IMPORT_ERROR = exc
 else:
     _MONAI_IMPORT_ERROR = None
@@ -68,8 +72,15 @@ def _require_monai() -> None:
 def build_monai_block_transforms(
     config: MonaiAugmentConfig,
     has_mask: bool,
+    spatial_size: Union[int, Sequence[int], None] = None,
 ) -> Dict[str, object]:
-    """Build train/val/test transforms for 2D channel-first block samples."""
+    """Build train/val/test transforms for 2D channel-first block samples.
+    
+    Args:
+        config: Augmentation configuration.
+        has_mask: Whether the samples include a mask.
+        spatial_size: Target spatial size (H, W) for resizing. If None or <=0, no resizing.
+    """
 
     _require_monai()
 
@@ -77,8 +88,34 @@ def build_monai_block_transforms(
     if has_mask:
         keys.append("mask")
 
+    # Build resize transform if spatial_size is specified
+    resize_transform = None
+    if spatial_size is not None:
+        if isinstance(spatial_size, int):
+            if spatial_size > 0:
+                spatial_size = (spatial_size, spatial_size)
+        elif hasattr(spatial_size, '__len__') and len(spatial_size) == 2:
+            if spatial_size[0] <= 0 or spatial_size[1] <= 0:
+                spatial_size = None
+        else:
+            spatial_size = None
+        
+        if spatial_size is not None:
+            mode = ["bilinear"] + (["nearest"] if has_mask else [])
+            resize_transform = Resized(
+                keys=keys,
+                spatial_size=spatial_size,
+                mode=mode,
+            )
+
     typed = EnsureTyped(keys=keys, dtype=torch.float32, track_meta=False)
-    eval_transform = Compose([typed])
+    
+    # Build eval transform (resize + type conversion)
+    eval_ops = []
+    if resize_transform is not None:
+        eval_ops.append(resize_transform)
+    eval_ops.append(typed)
+    eval_transform = Compose(eval_ops)
 
     if not config.enabled:
         return {
@@ -88,6 +125,10 @@ def build_monai_block_transforms(
         }
 
     train_ops = []
+    
+    # Add resize transform first if specified
+    if resize_transform is not None:
+        train_ops.append(resize_transform)
 
     use_affine = (
         config.affine_prob > 0.0
