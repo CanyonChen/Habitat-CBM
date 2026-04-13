@@ -346,6 +346,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, TextIO
 
+import matplotlib
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -360,6 +361,10 @@ from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import yaml
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 CURRENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CURRENT_DIR.parent
@@ -420,6 +425,7 @@ class EpochStats:
     val_f1: float
     val_sen: float
     val_spe: float
+    lr: float
 
 
 def str2bool(value: str) -> bool:
@@ -1025,6 +1031,19 @@ def make_json_safe(value: object) -> object:
     return value
 
 
+def save_yaml(data: Dict[str, object], path: Path) -> None:
+    """将字典以 UTF-8 YAML 格式保存到磁盘。"""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            make_json_safe(data),
+            f,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+
+
 def save_rows(rows: List[Dict[str, object]], path: Path, fieldnames: Sequence[str]) -> None:
     """将一组字典行保存成 CSV 文件。"""
 
@@ -1053,7 +1072,22 @@ def export_prediction_tables(
 
     此外还会导出：
     - metrics_summary_*.csv：所有 split 的指标汇总。
+    - metrics_*.csv：与 metrics_summary 内容相同的兼容别名。
     """
+
+    metrics_fieldnames = [
+        "split",
+        "loss",
+        "auc",
+        "acc",
+        "sen",
+        "spe",
+        "f1",
+        "num_patients",
+        "num_blocks",
+        "run_id",
+        "checkpoint_name",
+    ]
 
     for split_name, output in eval_outputs.items():
         if split_name == "train" and not save_train_predictions:
@@ -1097,6 +1131,11 @@ def export_prediction_tables(
                 output_dir / f"roc_raw_{MODEL_NAME}_{split_name}_{run_id}.csv",
                 fieldnames=["fpr", "tpr", "threshold", "model", "run_id"],
             )
+            save_rows(
+                roc_rows,
+                output_dir / f"roc_points_{MODEL_NAME}_{split_name}_{run_id}.csv",
+                fieldnames=["fpr", "tpr", "threshold", "model", "run_id"],
+            )
         save_rows(
             [
                 {
@@ -1135,6 +1174,260 @@ def export_prediction_tables(
     save_rows(
         metrics_rows,
         output_dir / f"metrics_summary_{MODEL_NAME}_{run_id}.csv",
+        fieldnames=metrics_fieldnames,
+    )
+    save_rows(
+        metrics_rows,
+        output_dir / f"metrics_{MODEL_NAME}_{run_id}.csv",
+        fieldnames=metrics_fieldnames,
+    )
+
+
+def save_training_history(history: Iterable[EpochStats], output_dir: Path, run_id: str) -> None:
+    """导出逐 epoch 的训练历史，便于后续画学习曲线或做实验记录。"""
+
+    rows = [asdict(item) for item in history]
+    fieldnames = [
+        "epoch",
+        "train_loss",
+        "train_block_acc",
+        "val_loss",
+        "val_auc",
+        "val_acc",
+        "val_f1",
+        "val_sen",
+        "val_spe",
+        "lr",
+    ]
+    save_rows(
+        rows,
+        output_dir / f"training_history_{MODEL_NAME}_{run_id}.csv",
+        fieldnames=fieldnames,
+    )
+    save_rows(rows, output_dir / f"train_log_{MODEL_NAME}_{run_id}.csv", fieldnames=fieldnames)
+    save_rows(rows, output_dir / "train_log.csv", fieldnames=fieldnames)
+
+
+def export_wrong_cases(
+    eval_outputs: Dict[str, Dict[str, object]],
+    output_dir: Path,
+    run_id: str,
+    threshold: float,
+) -> None:
+    """导出所有误判病例，便于后续做错误分析和典型病例整理。"""
+
+    wrong_rows: List[Dict[str, object]] = []
+    for split_name, output in eval_outputs.items():
+        for row in output["patient_rows"]:
+            y_true = int(row["y_true"])
+            pred_label = int(row["pred_label"])
+            if y_true == pred_label:
+                continue
+            error_type = "FP" if y_true == 0 and pred_label == 1 else "FN"
+            prob = float(row["prob_idh_mut"])
+            wrong_rows.append(
+                {
+                    **row,
+                    "error_type": error_type,
+                    "prob_margin_to_threshold": abs(prob - threshold),
+                    "is_low_confidence": int(abs(prob - threshold) < 0.1),
+                    "num_patients_in_split": output["num_patients"],
+                }
+            )
+
+    wrong_rows.sort(
+        key=lambda item: (
+            str(item["split"]),
+            str(item["error_type"]),
+            float(item["prob_margin_to_threshold"]),
+            str(item["patient_id"]),
+        )
+    )
+    save_rows(
+        wrong_rows,
+        output_dir / f"wrong_cases_{MODEL_NAME}_{run_id}.csv",
+        fieldnames=[
+            "patient_id",
+            "split",
+            "y_true",
+            "prob_idh_mut",
+            "pred_label",
+            "run_id",
+            "checkpoint_name",
+            "error_type",
+            "prob_margin_to_threshold",
+            "is_low_confidence",
+            "num_patients_in_split",
+        ],
+    )
+
+
+def plot_roc_curve(patient_rows: List[Dict[str, object]], path: Path, title: str) -> bool:
+    """根据病人级预测结果导出 ROC 曲线 PNG。"""
+
+    y_true = np.asarray([row["y_true"] for row in patient_rows], dtype=np.int64)
+    y_prob = np.asarray([row["prob_idh_mut"] for row in patient_rows], dtype=np.float64)
+    if len(np.unique(y_true)) < 2:
+        return False
+
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    auc = safe_auc(y_true, y_prob)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(5.5, 5.0), dpi=150)
+    ax.plot(fpr, tpr, color="#1f77b4", linewidth=2.0, label=f"AUC = {auc:.3f}")
+    ax.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", color="#999999", linewidth=1.2)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.05)
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title(title)
+    ax.legend(loc="lower right")
+    ax.grid(alpha=0.2, linewidth=0.5)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def plot_confusion_matrix(metrics: Dict[str, float], path: Path, title: str) -> None:
+    """根据病人级混淆矩阵导出 PNG。"""
+
+    matrix = np.asarray(
+        [
+            [int(metrics["tn"]), int(metrics["fp"])],
+            [int(metrics["fn"]), int(metrics["tp"])],
+        ],
+        dtype=np.int64,
+    )
+    labels = (("TN", "FP"), ("FN", "TP"))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(5.0, 4.5), dpi=150)
+    image = ax.imshow(matrix, cmap="Blues")
+    plt.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_xticks([0, 1], labels=["Pred 0", "Pred 1"])
+    ax.set_yticks([0, 1], labels=["True 0", "True 1"])
+    ax.set_title(title)
+
+    max_value = max(int(matrix.max()), 1)
+    for row_idx in range(matrix.shape[0]):
+        for col_idx in range(matrix.shape[1]):
+            value = int(matrix[row_idx, col_idx])
+            text_color = "white" if value > max_value / 2 else "black"
+            ax.text(
+                col_idx,
+                row_idx,
+                f"{labels[row_idx][col_idx]}\n{value}",
+                ha="center",
+                va="center",
+                color=text_color,
+                fontsize=10,
+            )
+
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def export_evaluation_figures(
+    eval_outputs: Dict[str, Dict[str, object]],
+    output_dir: Path,
+    run_id: str,
+) -> None:
+    """导出测试口径需要的 ROC 与混淆矩阵 PNG 图。"""
+
+    figure_dir = output_dir / "figures"
+    for split_name, output in eval_outputs.items():
+        patient_rows = output["patient_rows"]
+        metrics = output["metrics"]
+
+        roc_path = figure_dir / f"roc_curve_{MODEL_NAME}_{split_name}_{run_id}.png"
+        cm_path = figure_dir / f"confusion_matrix_{MODEL_NAME}_{split_name}_{run_id}.png"
+        wrote_roc = plot_roc_curve(
+            patient_rows=patient_rows,
+            path=roc_path,
+            title=f"{MODEL_NAME.upper()} ROC ({split_name})",
+        )
+        plot_confusion_matrix(
+            metrics=metrics,
+            path=cm_path,
+            title=f"{MODEL_NAME.upper()} Confusion Matrix ({split_name})",
+        )
+
+        if split_name == "test":
+            if wrote_roc:
+                plot_roc_curve(
+                    patient_rows=patient_rows,
+                    path=figure_dir / f"{MODEL_NAME}_roc.png",
+                    title=f"{MODEL_NAME.upper()} ROC (test)",
+                )
+            plot_confusion_matrix(
+                metrics=metrics,
+                path=figure_dir / f"{MODEL_NAME}_cm.png",
+                title=f"{MODEL_NAME.upper()} Confusion Matrix (test)",
+            )
+
+
+def aggregate_metric_rows(rows: List[Dict[str, str]]) -> List[Dict[str, object]]:
+    """将多次运行的指标表按 split 聚合为均值和标准差。"""
+
+    if not rows:
+        return []
+
+    numeric_fields = ("loss", "auc", "acc", "sen", "spe", "f1", "num_patients", "num_blocks")
+    grouped: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row["split"])].append(row)
+
+    summary_rows: List[Dict[str, object]] = []
+    for split_name in sorted(grouped):
+        split_rows = grouped[split_name]
+        summary_row: Dict[str, object] = {
+            "split": split_name,
+            "n_runs": len(split_rows),
+        }
+        for field in numeric_fields:
+            values = np.asarray(
+                [
+                    float(item[field])
+                    for item in split_rows
+                    if item.get(field, "") not in {"", "nan", "NaN"}
+                ],
+                dtype=np.float64,
+            )
+            if values.size == 0:
+                summary_row[f"{field}_mean"] = float("nan")
+                summary_row[f"{field}_std"] = float("nan")
+            else:
+                summary_row[f"{field}_mean"] = float(np.mean(values))
+                summary_row[f"{field}_std"] = float(np.std(values))
+        summary_rows.append(summary_row)
+    return summary_rows
+
+
+def update_cross_run_metric_summaries(output_root: Path) -> None:
+    """扫描输出根目录下所有运行结果，并更新跨运行指标汇总表。"""
+
+    all_rows: List[Dict[str, str]] = []
+    for run_dir in sorted(output_root.iterdir()):
+        if not run_dir.is_dir() or run_dir.name == "checkpoints":
+            continue
+
+        for metrics_path in sorted(run_dir.glob(f"metrics_summary_{MODEL_NAME}_*.csv")):
+            with metrics_path.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    row["source_file"] = str(metrics_path.relative_to(output_root))
+                    all_rows.append(row)
+
+    if not all_rows:
+        return
+
+    all_rows.sort(key=lambda item: (str(item.get("run_id", "")), str(item.get("split", ""))))
+    save_rows(
+        all_rows,
+        output_root / f"metrics_{MODEL_NAME}_all_runs.csv",
         fieldnames=[
             "split",
             "loss",
@@ -1147,29 +1440,78 @@ def export_prediction_tables(
             "num_blocks",
             "run_id",
             "checkpoint_name",
+            "source_file",
         ],
     )
 
-
-def save_training_history(history: Iterable[EpochStats], output_dir: Path, run_id: str) -> None:
-    """导出逐 epoch 的训练历史，便于后续画学习曲线或做实验记录。"""
-
-    rows = [asdict(item) for item in history]
+    summary_rows = aggregate_metric_rows(all_rows)
     save_rows(
-        rows,
-        output_dir / f"training_history_{MODEL_NAME}_{run_id}.csv",
+        summary_rows,
+        output_root / f"metrics_{MODEL_NAME}_summary.csv",
         fieldnames=[
-            "epoch",
-            "train_loss",
-            "train_block_acc",
-            "val_loss",
-            "val_auc",
-            "val_acc",
-            "val_f1",
-            "val_sen",
-            "val_spe",
+            "split",
+            "n_runs",
+            "loss_mean",
+            "loss_std",
+            "auc_mean",
+            "auc_std",
+            "acc_mean",
+            "acc_std",
+            "sen_mean",
+            "sen_std",
+            "spe_mean",
+            "spe_std",
+            "f1_mean",
+            "f1_std",
+            "num_patients_mean",
+            "num_patients_std",
+            "num_blocks_mean",
+            "num_blocks_std",
         ],
     )
+
+
+def export_run_config_yaml(args: argparse.Namespace, output_dir: Path) -> None:
+    """导出当前运行配置的 YAML 版本，便于锁定基线实验口径。"""
+
+    config_payload = {
+        "model": MODEL_NAME,
+        "modalities": list(args.modalities),
+        "split_base_root": args.split_base_root,
+        "output_root": args.output_root,
+        "checkpoint_root": args.checkpoint_root,
+        "data": {
+            "require_voi": args.require_voi,
+            "append_voi_mask": args.append_voi_mask,
+            "mask_background_with_voi": args.mask_background_with_voi,
+            "block_depth": args.block_depth,
+            "slice_axis": args.slice_axis,
+            "intensity_norm": args.intensity_norm,
+            "min_nonzero_voxels": args.min_nonzero_voxels,
+            "cache_volumes": args.cache_volumes,
+            "resize_height": args.resize_height,
+            "resize_width": args.resize_width,
+        },
+        "train": {
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "num_workers": args.num_workers,
+            "seed": args.seed,
+            "pretrained": args.pretrained,
+            "use_class_weights": args.use_class_weights,
+            "early_stop_patience": args.early_stop_patience,
+            "early_stop_min_delta": args.early_stop_min_delta,
+            "save_train_predictions": args.save_train_predictions,
+            "save_interval": args.save_interval,
+            "threshold": args.threshold,
+            "device": args.device,
+        },
+        "augmentation": build_augmentation_config(args).to_dict(),
+    }
+    save_yaml(config_payload, output_dir / "configs" / "resnet18_base.yaml")
+
 
 
 def choose_monitor_score(eval_output: Dict[str, object]) -> float:
@@ -1247,6 +1589,7 @@ def main() -> None:
     run_id = resolve_run_id(args.run_id)
     output_dir = args.output_root / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
+    export_run_config_yaml(args, output_dir)
 
     # 若启用日志文件，使用 TeeLogger 同时输出到终端和文件
     if args.log_to_file:
@@ -1322,6 +1665,7 @@ def _main_training_loop(
 
         # 验证集指标以病人级别结果为准，用于选择最佳模型。
         metrics = val_output["metrics"]
+        current_lr = float(optimizer.param_groups[0]["lr"])
         history.append(
             EpochStats(
                 epoch=epoch,
@@ -1333,6 +1677,7 @@ def _main_training_loop(
                 val_f1=metrics["f1"],
                 val_sen=metrics["sen"],
                 val_spe=metrics["spe"],
+                lr=current_lr,
             )
         )
 
@@ -1422,6 +1767,17 @@ def _main_training_loop(
         save_train_predictions=args.save_train_predictions,
     )
     save_training_history(history, output_dir, run_id)
+    export_wrong_cases(
+        eval_outputs=eval_outputs,
+        output_dir=output_dir,
+        run_id=run_id,
+        threshold=args.threshold,
+    )
+    export_evaluation_figures(
+        eval_outputs=eval_outputs,
+        output_dir=output_dir,
+        run_id=run_id,
+    )
     write_run_summary(
         args=args,
         datasets=datasets,
@@ -1435,6 +1791,7 @@ def _main_training_loop(
     # 额外保存本次运行的完整参数配置，便于复现实验。
     args_path = output_dir / f"run_config_{MODEL_NAME}_{run_id}.json"
     save_json(vars(args), args_path)
+    update_cross_run_metric_summaries(args.output_root)
     print(f"Run completed. Best epoch: {best_epoch}.")
     print(f"Checkpoint: {best_checkpoint_path}")
     print(f"Outputs   : {output_dir}")
