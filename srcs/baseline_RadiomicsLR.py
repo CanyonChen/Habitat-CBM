@@ -302,7 +302,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--split-base-root",
         type=Path,
-        default=PROJECT_ROOT / "data" / "splited_data",
+        default=PROJECT_ROOT / "dataset" / "splited_data",
         help="包含 train/、val/、test/ 的患者级划分目录。",
     )
     parser.add_argument(
