@@ -370,6 +370,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from models.resnet_18 import ResNet18Classifier
 from srcs.data_loader import DEFAULT_MODALITIES, HabitatIDHBlockDataset, VOI_SOURCE_BRANCH
+from srcs.monai_augmentation import MonaiAugmentConfig, build_monai_block_transforms
 
 MODEL_NAME = "resnet18"
 DEFAULT_SEED = 42
@@ -510,6 +511,66 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Minimum foreground voxels required for a center slice; when VOI is enabled this is counted on functional/voi.",
     )
     parser.add_argument("--cache-volumes", type=str2bool, default=True, help="Cache volumes.")
+    parser.add_argument(
+        "--use-monai-augmentation",
+        type=str2bool,
+        default=True,
+        help="Enable the MONAI training augmentation pipeline on the train split.",
+    )
+    parser.add_argument(
+        "--aug-affine-prob",
+        type=float,
+        default=0.5,
+        help="Probability of applying the shared affine transform on image/mask.",
+    )
+    parser.add_argument(
+        "--aug-rotate-deg",
+        type=float,
+        default=10.0,
+        help="Maximum in-plane rotation angle in degrees for RandAffined.",
+    )
+    parser.add_argument(
+        "--aug-translate-px",
+        type=float,
+        default=8.0,
+        help="Maximum in-plane translation in pixels for RandAffined.",
+    )
+    parser.add_argument(
+        "--aug-scale-range",
+        type=float,
+        default=0.1,
+        help="Maximum isotropic scaling factor delta for RandAffined.",
+    )
+    parser.add_argument(
+        "--aug-flip-prob",
+        type=float,
+        default=0.5,
+        help="Probability of left-right flipping the 2D slice block.",
+    )
+    parser.add_argument(
+        "--aug-intensity-scale-prob",
+        type=float,
+        default=0.3,
+        help="Probability of applying intensity scaling on the image channels.",
+    )
+    parser.add_argument(
+        "--aug-intensity-scale",
+        type=float,
+        default=0.1,
+        help="Maximum intensity scaling factor used by RandScaleIntensityd.",
+    )
+    parser.add_argument(
+        "--aug-intensity-shift-prob",
+        type=float,
+        default=0.3,
+        help="Probability of applying intensity shifting on the image channels.",
+    )
+    parser.add_argument(
+        "--aug-intensity-shift",
+        type=float,
+        default=0.1,
+        help="Maximum std-based intensity shift used by RandStdShiftIntensityd.",
+    )
     parser.add_argument("--batch-size", type=int, default=32, help="Mini-batch size.")
     parser.add_argument("--epochs", type=int, default=200, help="Training epochs.")
     parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate.")
@@ -604,6 +665,23 @@ def resolve_run_id(run_id: str | None) -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
 
+def build_augmentation_config(args: argparse.Namespace) -> MonaiAugmentConfig:
+    """Convert CLI arguments into a MONAI augmentation config."""
+
+    return MonaiAugmentConfig(
+        enabled=args.use_monai_augmentation,
+        affine_prob=args.aug_affine_prob,
+        rotate_deg=args.aug_rotate_deg,
+        translate_px=args.aug_translate_px,
+        scale_range=args.aug_scale_range,
+        flip_prob=args.aug_flip_prob,
+        intensity_scale_prob=args.aug_intensity_scale_prob,
+        intensity_scale=args.aug_intensity_scale,
+        intensity_shift_prob=args.aug_intensity_shift_prob,
+        intensity_shift=args.aug_intensity_shift,
+    )
+
+
 def build_datasets(args: argparse.Namespace) -> Dict[str, HabitatIDHBlockDataset]:
     """
     根据 train / val / test 目录构建数据集对象。
@@ -614,6 +692,13 @@ def build_datasets(args: argparse.Namespace) -> Dict[str, HabitatIDHBlockDataset
     3. 强度归一化；
     4. 返回病人元信息，供后续 block -> patient 聚合使用。
     """
+
+    has_mask = args.require_voi or args.append_voi_mask or args.mask_background_with_voi
+    augment_config = build_augmentation_config(args)
+    transforms = build_monai_block_transforms(
+        config=augment_config,
+        has_mask=has_mask,
+    )
 
     datasets: Dict[str, HabitatIDHBlockDataset] = {}
     for split_name in ("train", "val", "test"):
@@ -635,6 +720,7 @@ def build_datasets(args: argparse.Namespace) -> Dict[str, HabitatIDHBlockDataset
             min_nonzero_voxels=args.min_nonzero_voxels,
             cache_volumes=args.cache_volumes,
             return_metadata=True,
+            transform=transforms[split_name],
         )
     return datasets
 
@@ -1129,6 +1215,7 @@ def write_run_summary(
         "slice_axis": args.slice_axis,
         "intensity_norm": args.intensity_norm,
         "threshold": args.threshold,
+        "augmentation": build_augmentation_config(args).to_dict(),
         "datasets": {split: dataset.summary() for split, dataset in datasets.items()},
         "metrics": {
             split: {

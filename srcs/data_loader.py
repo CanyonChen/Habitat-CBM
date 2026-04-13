@@ -134,7 +134,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import nibabel as nib
 import numpy as np
@@ -478,6 +478,14 @@ def build_slice_block(volume: np.ndarray, center_index: int, axis: int, block_de
     return np.stack(slices, axis=0)
 
 
+def ensure_tensor(data: object, dtype: torch.dtype) -> torch.Tensor:
+    """Convert MONAI / NumPy outputs into a torch tensor with the target dtype."""
+
+    if isinstance(data, torch.Tensor):
+        return data.to(dtype=dtype)
+    return torch.as_tensor(data, dtype=dtype)
+
+
 class HabitatIDHBlockDataset(Dataset):
     """胶质瘤 IDH 通用 2.5D 数据加载器。
 
@@ -500,6 +508,7 @@ class HabitatIDHBlockDataset(Dataset):
         min_nonzero_voxels: int = 16,
         cache_volumes: bool = True,
         return_metadata: bool = True,
+        transform: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
     ) -> None:
         if block_depth % 2 == 0:
             raise ValueError("block_depth must be an odd number, e.g. 3, 5, or 7.")
@@ -517,6 +526,7 @@ class HabitatIDHBlockDataset(Dataset):
         self.min_nonzero_voxels = min_nonzero_voxels
         self.cache_volumes = cache_volumes
         self.return_metadata = return_metadata
+        self.transform = transform
 
         # 体数据缓存：key 为 patient_id，value 为 {modality: volume_array}
         self._volume_cache: Dict[str, Dict[str, np.ndarray]] = {}
@@ -691,13 +701,44 @@ class HabitatIDHBlockDataset(Dataset):
                 block = block * voi_block
             modality_blocks.append(block)
 
-        if voi_block is not None and self.append_voi_mask:
-            modality_blocks.append(voi_block)
+        sample_dict: Dict[str, object] = {
+            "image": np.concatenate(modality_blocks, axis=0).astype(np.float32),
+            "label": case.label_id,
+        }
+        if voi_block is not None:
+            sample_dict["mask"] = voi_block.astype(np.float32)
 
-        # 拼接后的形状为 [num_modalities * block_depth, H, W]
-        image = np.concatenate(modality_blocks, axis=0).astype(np.float32)
-        image_tensor = torch.from_numpy(image)
-        label_tensor = torch.tensor(case.label_id, dtype=torch.long)
+        if self.transform is not None:
+            sample_dict = dict(self.transform(sample_dict))
+
+        image_tensor = ensure_tensor(sample_dict["image"], dtype=torch.float32)
+        if image_tensor.ndim != 3:
+            raise ValueError(
+                f"Expected image tensor with shape [C, H, W], got {tuple(image_tensor.shape)} "
+                f"for patient {patient_id}, slice {slice_index}."
+            )
+
+        if voi_block is not None and self.append_voi_mask:
+            if "mask" not in sample_dict:
+                raise KeyError(
+                    "Mask is required for append_voi_mask=True, but transform output has no 'mask' key."
+                )
+            mask_tensor = ensure_tensor(sample_dict["mask"], dtype=torch.float32)
+            if mask_tensor.ndim != 3:
+                raise ValueError(
+                    f"Expected mask tensor with shape [C, H, W], got {tuple(mask_tensor.shape)} "
+                    f"for patient {patient_id}, slice {slice_index}."
+                )
+            if image_tensor.shape[1:] != mask_tensor.shape[1:]:
+                raise ValueError(
+                    f"Image/mask spatial shape mismatch after transform for patient {patient_id}: "
+                    f"image={tuple(image_tensor.shape)}, mask={tuple(mask_tensor.shape)}"
+                )
+            image_tensor = torch.cat([image_tensor, mask_tensor], dim=0)
+
+        label_tensor = ensure_tensor(sample_dict["label"], dtype=torch.long)
+        if label_tensor.ndim != 0:
+            label_tensor = label_tensor.reshape(()).to(dtype=torch.long)
 
         output: Dict[str, object] = {
             "image": image_tensor,
@@ -738,6 +779,7 @@ class HabitatIDHBlockDataset(Dataset):
             "slice_axis": self.slice_axis,
             "intensity_norm": self.intensity_norm,
             "min_nonzero_voxels": self.min_nonzero_voxels,
+            "transform_enabled": self.transform is not None,
             "mutant_count": mutant_count,
             "wild_type_count": wild_count,
         }

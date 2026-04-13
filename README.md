@@ -1,6 +1,6 @@
 # Habitat-CBM
 
-胶质瘤 IDH 突变状态预测的深度学习基线框架。基于多模态 MRI（T1/T1CE/T2/T2FLAIR/ADC/CBF）进行患者级别的二分类（野生型 vs 突变型）。
+胶质瘤 IDH 突变状态预测的深度学习基线框架。基于多模态 MRI（T1/T1CE/T2/T2FLAIR/ADC/CBF）进行患者级别的二分类（野生型 vs 突变型），并提供基于 MONAI 的 2.5D 数据增强 pipeline。
 
 ## 快速开始
 
@@ -30,6 +30,7 @@ repo/
 ├── srcs/
 │   ├── data_split.py          # 患者级分层数据划分
 │   ├── data_loader.py         # 2.5D 多模态数据加载器
+│   ├── monai_augmentation.py  # MONAI 数据增强配置与 transform 构建器
 │   └── baseline_ResNet18.py   # ResNet-18 训练/评估脚本
 ├── models/
 │   └── resnet_18.py           # 适配多通道输入的 ResNet-18
@@ -100,6 +101,7 @@ dataset = HabitatIDHBlockDataset(
     mask_background_with_voi=False,
     intensity_norm="zscore",    # zscore | minmax | none
     min_nonzero_voxels=16,
+    transform=None,             # 可接 MONAI Compose / RandAffined 等 pipeline
 )
 # 返回: {"image": [C,H,W], "label": int, "patient_id": str, "slice_index": int}
 ```
@@ -126,6 +128,11 @@ model = ResNet18Classifier(
 | `--block-depth` | 5 | 2.5D block 深度 |
 | `--append-voi-mask` | true | VOI 作为额外通道 |
 | `--mask-background-with-voi` | false | VOI 外区域置零 |
+| `--use-monai-augmentation` | true | 训练集启用 MONAI 增强 |
+| `--aug-rotate-deg` | 10.0 | 最大旋转角度（度） |
+| `--aug-translate-px` | 8.0 | 最大平移像素 |
+| `--aug-scale-range` | 0.1 | 最大缩放幅度 |
+| `--aug-flip-prob` | 0.5 | 左右翻转概率 |
 | `--pretrained` | true | ImageNet 预训练 |
 | `--use-class-weights` | true | 类别不平衡加权 |
 | `--early-stop-patience` | 5 | 早停耐心值 |
@@ -155,6 +162,18 @@ python srcs/baseline_ResNet18.py \
     --intensity-norm zscore
 ```
 
+### 使用 MONAI 训练增强
+```bash
+python srcs/baseline_ResNet18.py \
+    --use-monai-augmentation true \
+    --aug-rotate-deg 10 \
+    --aug-translate-px 8 \
+    --aug-scale-range 0.1 \
+    --aug-flip-prob 0.5 \
+    --aug-intensity-scale-prob 0.3 \
+    --aug-intensity-shift-prob 0.3
+```
+
 ## 输出文件说明
 
 | 文件 | 内容 |
@@ -171,7 +190,7 @@ python srcs/baseline_ResNet18.py \
 
 - Python 3.10+
 - PyTorch 2.2+
-- torchvision, nibabel, SimpleITK
+- monai, torchvision, nibabel, SimpleITK
 - scikit-learn, numpy, pandas, tqdm
 
 影像组学特征提取需额外创建 Python 3.10/3.11 环境（pyradiomics 与 Python 3.12 不兼容）。
