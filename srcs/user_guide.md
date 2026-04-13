@@ -13,9 +13,10 @@
 4. [data_loader.py - 数据加载](#data_loaderpy---数据加载)
 5. [monai_augmentation.py - 数据增强](#monai_augmentationpy---数据增强)
 6. [baseline_ResNet18.py - 基线训练](#baseline_resnet18py---基线训练)
-7. [典型工作流程](#典型工作流程)
-8. [数据流说明](#数据流说明)
-9. [常见问题排查](#常见问题排查)
+7. [baseline_RadiomicsLR.py - 传统影像组学基线](#baseline_radiomicslrpy---传统影像组学基线)
+8. [典型工作流程](#典型工作流程)
+9. [数据流说明](#数据流说明)
+10. [常见问题排查](#常见问题排查)
 
 ---
 
@@ -24,15 +25,23 @@
 ### 环境要求
 
 ```bash
-# 安装依赖
+# 深度学习主环境
 pip install -r habitat_CBM/repo/requirements.txt
 
-# 核心依赖
+# 传统影像组学专用环境（推荐单独创建 Python 3.10/3.11 环境）
+pip install -r habitat_CBM/repo/requirements_pyradiomics.txt
+
+# 主环境核心依赖
 - torch >= 2.0
 - monai >= 1.3
 - nibabel >= 4.0
 - numpy, scipy, scikit-learn
 - matplotlib, tqdm, pyyaml
+
+# Radiomics 额外依赖
+- SimpleITK
+- pyradiomics
+- joblib
 ```
 
 ### 三步完成训练
@@ -55,6 +64,13 @@ python habitat_CBM/repo/srcs/baseline_ResNet18.py \
     --output-root /path/to/results \
     --epochs 200 \
     --batch-size 32
+
+# 4. 训练传统影像组学 + LASSO LR 基线模型
+python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
+    --split-base-root /path/to/splited_data \
+    --output-root /path/to/results/baseline_RadiomicsLR \
+    --n-jobs 20 \
+    --cv-folds 5
 ```
 
 ---
@@ -67,6 +83,7 @@ python habitat_CBM/repo/srcs/baseline_ResNet18.py \
 | `data_loader.py` | 2.5D 数据加载 | 读取多模态 MRI 并生成 2.5D blocks | `splited_data/` 目录 | PyTorch Dataset |
 | `monai_augmentation.py` | 数据增强 | 提供训练时的数据增强变换 | Dataset samples | Augmented samples |
 | `baseline_ResNet18.py` | 基线训练 | 训练 ResNet-18 进行 IDH 分类 | 划分后的数据 | 模型、预测、指标 |
+| `baseline_RadiomicsLR.py` | 传统影像组学基线 | 提取 PyRadiomics 特征并训练 LASSO Logistic Regression | 划分后的 `conventional/` 数据 | 特征表、模型、预测、指标 |
 
 ---
 
@@ -575,6 +592,186 @@ weight = N / (n_classes × count)
 
 ---
 
+## baseline_RadiomicsLR.py - 传统影像组学基线
+
+### 功能描述
+
+`baseline_RadiomicsLR.py` 用于构建患者级传统影像组学基线，完整流程为：
+
+1. 从 `train / val / test` 的 `conventional/` 分支读取病例；
+2. 仅使用 `T1 / T1CE / T2 / T2-FLAIR` 和 `conventional/voi`；
+3. 用 PyRadiomics 提取 3D `Original` 图像的一阶统计、形状和纹理特征；
+4. 在训练集内完成：
+   - `median` 缺失值填补
+   - `VarianceThreshold`
+   - `StandardScaler`
+   - `LASSO` 特征选择
+   - `LASSO Logistic Regression` 分类
+5. 导出患者级预测、ROC、混淆矩阵、错误病例、特征筛选表和运行摘要。
+
+这个脚本的设计目标不是做“最复杂的传统模型”，而是做一个**规范、可复核、和主模型公平可比**的传统基线。
+
+### 方法约束
+
+- **只用四个常规序列**：`t1`、`t1ce`、`t2`、`t2flair`
+- **只用全肿瘤 VOI**：固定使用 `conventional/` 分支下的 `voi`
+- **特征类型固定**：`firstorder`、`shape`、`glcm`、`glrlm`、`glszm`、`gldm`、`ngtdm`
+- **特征选择和分类器都用 LASSO**
+- **超参数只在训练集内通过 k 折交叉验证确定**
+- **验证集和测试集只做独立评估**
+
+### 为什么 shape 特征只提取一次
+
+`shape` 特征只依赖掩模本身，不依赖图像灰度。如果在四个模态上都提一次，会得到四份几乎完全相同的形状特征，既冗余，也会放大共线性问题。
+
+因此脚本默认只在 `t1ce` 上提一次 shape 特征，并通过 `--shape-reference-modality` 显式记录这个选择。
+
+### 为什么 GPU 不是主加速路径
+
+- PyRadiomics 的特征提取主要依赖 `SimpleITK` 和 CPU；
+- sklearn 的 `L1 LogisticRegressionCV` 也主要走 CPU；
+- 因此这个脚本在 Linux 服务器上的主要加速方式是：
+  - 提高 `--n-jobs`
+  - 控制 `--itk-threads-per-worker`
+  - 避免过度线程竞争
+
+推荐在 25 vCPU 环境下优先尝试：
+
+```bash
+--n-jobs 16~20
+--itk-threads-per-worker 1
+```
+
+### 核心参数
+
+#### 路径相关
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--split-base-root` | `Path` | `data/splited_data` | 包含 `train/val/test` 的患者级划分目录 |
+| `--output-root` | `Path` | `results/baseline_RadiomicsLR` | 结果输出根目录 |
+| `--checkpoint-root` | `Path` | `results/baseline_RadiomicsLR/checkpoints` | 最终模型工件保存目录 |
+| `--run-id` | `str` | 时间戳 | 本次运行标识 |
+
+#### 输入与 radiomics 预处理
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--shape-reference-modality` | `str` | `t1ce` | shape 特征提取参考模态 |
+| `--label-value` | `int` | 1 | VOI 掩模中的有效标签值 |
+| `--resampled-spacing` | `tuple/none` | `1,1,1` | PyRadiomics 等体素重采样间距 |
+| `--interpolator` | `str` | `sitkBSpline` | 影像重采样插值方式 |
+| `--normalize` | `bool` | True | 是否启用 PyRadiomics 内部强度归一化 |
+| `--normalize-scale` | `float` | 100 | normalizeScale |
+| `--remove-outliers` | `float` | 3.0 | 离群值裁剪阈值 |
+| `--bin-width` | `float` | 25.0 | 灰度离散化 binWidth |
+| `--pad-distance` | `int` | 5 | padDistance |
+| `--correct-mask-geometry` | `bool` | True | 掩模几何不一致时自动重采样到影像空间 |
+
+#### LASSO 建模与交叉验证
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--cv-folds` | `int` | 5 | 训练集内分层 k 折数 |
+| `--selector-c-grid` | `tuple` | 一组对数间隔值 | LASSO 特征选择的 C 搜索网格 |
+| `--classifier-c-grid` | `tuple` | 一组对数间隔值 | LASSO 分类器的 C 搜索网格 |
+| `--cv-scoring` | `str` | `roc_auc` | 交叉验证评分函数 |
+| `--variance-threshold` | `float` | 0.0 | 方差过滤阈值 |
+| `--max-iter` | `int` | 5000 | LASSO Logistic 最大迭代次数 |
+| `--use-class-weights` | `bool` | True | 是否启用 `class_weight="balanced"` |
+| `--threshold` | `float` | 0.5 | 患者级分类阈值 |
+| `--feature-selection-fallback` | `bool` | True | 若最优 selector 全零，是否尝试更大 C 做稳定性兜底 |
+
+#### 并行和输出
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--n-jobs` | `int` | 自动估计 | radiomics 提取和 CV 并行进程数 |
+| `--itk-threads-per-worker` | `int` | 1 | 每个 worker 内部允许的 ITK 线程数 |
+| `--save-train-predictions` | `bool` | True | 是否导出训练集患者级预测 |
+| `--save-feature-table` | `bool` | True | 是否保存所有患者的原始 radiomics 特征表 |
+| `--save-selected-feature-table` | `bool` | True | 是否保存最终选中特征子表 |
+| `--log-to-file` | `bool` | True | 是否将终端输出写入日志文件 |
+| `--seed` | `int` | 42 | 随机种子 |
+
+### 输出目录结构
+
+```text
+output_root/
+└── {run_id}/
+    ├── configs/
+    │   └── radiomics_lr_base.yaml
+    ├── figures/
+    │   ├── roc_curve_radiomics_lr_test_{run_id}.png
+    │   ├── confusion_matrix_radiomics_lr_test_{run_id}.png
+    │   ├── radiomics_lr_roc.png
+    │   └── radiomics_lr_cm.png
+    ├── radiomics_features_raw_radiomics_lr_{run_id}.csv
+    ├── radiomics_features_selected_radiomics_lr_{run_id}.csv
+    ├── patient_predictions_radiomics_lr_train_{run_id}.csv
+    ├── patient_predictions_radiomics_lr_val_{run_id}.csv
+    ├── patient_predictions_radiomics_lr_test_{run_id}.csv
+    ├── patient_predictions_radiomics_lr.csv
+    ├── roc_points_radiomics_lr_test_{run_id}.csv
+    ├── roc_points_radiomics_lr.csv
+    ├── confusion_matrix_radiomics_lr_test_{run_id}.csv
+    ├── confusion_matrix_radiomics_lr.csv
+    ├── metrics_summary_radiomics_lr_{run_id}.csv
+    ├── metrics_radiomics_lr_{run_id}.csv
+    ├── metrics_radiomics_lr.csv
+    ├── selected_features_radiomics_lr_{run_id}.csv
+    ├── selected_features_radiomics_lr.csv
+    ├── wrong_cases_radiomics_lr_{run_id}.csv
+    ├── wrong_cases_radiomics_lr.csv
+    ├── scaler_stats_radiomics_lr.json
+    ├── radiomics_lr_protocol.md
+    ├── cv_results_radiomics_lr_{run_id}.csv
+    ├── run_summary_radiomics_lr_{run_id}.json
+    ├── run_config_radiomics_lr_{run_id}.json
+    └── training_log_radiomics_lr_{run_id}.txt
+
+checkpoint_root/
+└── {run_id}/
+    ├── best.joblib
+    └── last.joblib
+```
+
+### 运行示例
+
+```bash
+# 1. 最常规的运行方式
+python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
+    --split-base-root /path/to/splited_data \
+    --output-root habitat_CBM/results/baseline_RadiomicsLR \
+    --checkpoint-root habitat_CBM/results/baseline_RadiomicsLR/checkpoints \
+    --cv-folds 5 \
+    --n-jobs 20 \
+    --seed 42 \
+    --run-id baseline_radiomics_lr_seed42
+
+# 2. 如果上游图像已经是等体素，关闭 radiomics 内部重采样
+python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
+    --split-base-root /path/to/splited_data \
+    --resampled-spacing none \
+    --run-id baseline_radiomics_lr_no_resample
+
+# 3. 收紧线程，避免服务器共享环境中的资源竞争
+python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
+    --split-base-root /path/to/splited_data \
+    --n-jobs 12 \
+    --itk-threads-per-worker 1 \
+    --run-id baseline_radiomics_lr_safe_threads
+```
+
+### 使用建议
+
+- 这个基线的重点是**规范性**，不是复杂度。
+- 不建议在第一版 baseline 中加入 wavelet、LoG、成百上千个派生特征。
+- 不建议用测试集调 `C`、调阈值或调特征筛选规则。
+- 如果 `selected_features_radiomics_lr.csv` 中保留特征非常少，不一定是坏事；LASSO 的作用就是在小样本高维场景中做强约束。
+
+---
+
 ## 典型工作流程
 
 ### 完整实验流程
@@ -598,7 +795,7 @@ for split in train val test; do
         --max-samples 2
 done
 
-# Step 3: 训练基线模型
+# Step 3A: 训练 ResNet-18 深度学习基线
 python habitat_CBM/repo/srcs/baseline_ResNet18.py \
     --split-base-root habitat_CBM/data/splited_data \
     --output-root habitat_CBM/results/baseline_ResNet18 \
@@ -613,8 +810,19 @@ python habitat_CBM/repo/srcs/baseline_ResNet18.py \
     --seed 42 \
     --run-id baseline_seed42
 
+# Step 3B: 训练传统影像组学 + LASSO LR 基线
+python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
+    --split-base-root habitat_CBM/data/splited_data \
+    --output-root habitat_CBM/results/baseline_RadiomicsLR \
+    --checkpoint-root habitat_CBM/results/baseline_RadiomicsLR/checkpoints \
+    --cv-folds 5 \
+    --n-jobs 20 \
+    --seed 42 \
+    --run-id baseline_radiomics_lr_seed42
+
 # Step 4: 查看结果
 cat habitat_CBM/results/baseline_ResNet18/baseline_seed42/metrics_summary_resnet18_baseline_seed42.csv
+cat habitat_CBM/results/baseline_RadiomicsLR/baseline_radiomics_lr_seed42/metrics_radiomics_lr.csv
 ```
 
 ### 多折交叉验证
@@ -784,6 +992,37 @@ cat habitat_CBM/results/cv_runs/metrics_resnet18_summary.csv
 尝试调整学习率
 ```
 
+### 5. Radiomics 问题
+
+**Q: PyRadiomics 报 mask / image geometry mismatch**
+```
+优先检查上游配准和导出是否正确
+若只是 metadata 不一致，可保持 --correct-mask-geometry true
+仍报错时，用 SimpleITK 检查 size / spacing / origin / direction
+```
+
+**Q: LASSO selector 选出 0 个特征**
+```
+先查看 radiomics_features_raw_*.csv 是否存在大量 NaN
+检查 VOI 是否为空或过小
+检查四个模态是否都真的完成了上游配准
+必要时扩大 --selector-c-grid 的上界
+也可以保留 --feature-selection-fallback true 作为稳定性兜底
+```
+
+**Q: 运行很慢**
+```
+Radiomics 提取本来就是 CPU 密集型
+提高 --n-jobs，但建议保持 --itk-threads-per-worker 1
+如果服务器多人共享，先从 --n-jobs 8~12 开始试
+```
+
+**Q: 为什么没有使用 GPU**
+```
+PyRadiomics 和 sklearn 的 L1 LogisticRegressionCV 都主要走 CPU
+这个脚本的主要加速方式是 Linux 多进程并行，而不是 CUDA
+```
+
 ---
 
 ## 版本历史
@@ -791,6 +1030,7 @@ cat habitat_CBM/results/cv_runs/metrics_resnet18_summary.csv
 | 版本 | 日期 | 说明 |
 |------|------|------|
 | 1.0 | 2024 | 初始版本，支持 ResNet-18 基线训练 |
+| 1.1 | 2026-04-14 | 新增 `baseline_RadiomicsLR.py`，支持传统影像组学 + LASSO LR 基线 |
 
 ---
 
