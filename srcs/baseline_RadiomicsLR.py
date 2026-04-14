@@ -1341,7 +1341,11 @@ def transform_feature_matrix(
 ) -> np.ndarray:
     """将原始特征矩阵变换到最终分类器输入空间。
 
-    变换顺序：impute → variance_filter → scale → univariate_prescreen → lasso_mask
+    变换顺序：impute → variance_filter → scale → univariate_prescreen
+
+    注意：classifier_cv 在完整的 prescreened 空间上训练，推理时直接传入
+    x_prescreened 即可；selected_mask_prescreened 仅用于特征统计报告，
+    不在此处做切片。
     """
 
     x_imputed = pipeline["imputer"].transform(raw_matrix)
@@ -1354,8 +1358,7 @@ def transform_feature_matrix(
     else:
         x_prescreened = x_scaled
 
-    selected_mask = np.asarray(pipeline["selected_mask_prescreened"], dtype=bool)
-    return x_prescreened[:, selected_mask]
+    return x_prescreened
 
 
 def predict_split(
