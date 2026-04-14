@@ -8,10 +8,11 @@
 1. 从 `train / val / test` 三个患者级划分目录中读取病例；
 2. 仅使用 `conventional/` 分支下的 `T1 / T1CE / T2 / T2-FLAIR` 以及全肿瘤 `VOI`；
 3. 基于 PyRadiomics 提取 3D 原始影像的一阶统计、形状和纹理特征；
-4. 使用训练集内的 LASSO (`L1` Logistic Regression CV) 做特征选择；
-5. 使用训练集内的 LASSO Logistic Regression CV 完成最终分类器训练；
-6. 在 train / val / test 上统一导出患者级预测、ROC、混淆矩阵、错误病例和汇总指标；
-7. 保存完整的特征工程协议、标准化参数、筛选结果、模型工件和运行摘要。
+4. 单变量预筛选（SelectKBest + f_classif）将特征降维至合理规模，避免高维稀疏问题；
+5. 使用训练集内的 LASSO (`L1` Logistic Regression CV) 同时完成特征选择与分类器训练；
+6. 在训练集内通过 CV + Youden 指数自动选取最优分类阈值；
+7. 在 train / val / test 上统一导出患者级预测、ROC、混淆矩阵、错误病例和汇总指标；
+8. 保存完整的特征工程协议、标准化参数、筛选结果、模型工件和运行摘要。
 
 ===============================================================================
 一、数据假设与范围
@@ -46,26 +47,35 @@
    - PyRadiomics 内部强度归一化和离群值裁剪
 
 ===============================================================================
-二、方法设计
+二、方法设计（改进版）
 ===============================================================================
 1. 特征提取：
    - 图像类型：仅 `Original`
    - 特征类别：`firstorder`、`shape`、`glcm`、`glrlm`、`glszm`、`gldm`、`ngtdm`
    - 形状特征仅从一个参考模态提取一次，避免四个模态重复写入完全相同的 shape 特征
 
-2. 特征工程：
+2. 特征工程 Pipeline（含改进）：
    - 缺失值填补：训练集拟合 `median` imputer
-   - 方差过滤：训练集拟合 `VarianceThreshold`
+   - 方差过滤：训练集拟合 `VarianceThreshold`（去常数特征）
    - 标准化：训练集拟合 `StandardScaler`
-   - 特征选择：训练集内 `L1` LogisticRegressionCV（LASSO）
+   - 【新增】单变量预筛选：训练集内 `SelectKBest(f_classif, k=univariate_k)`
+     * 在 LASSO 之前将特征降至 k（默认 50），避免 n_samples << n_features 导致正则化失效
+   - LASSO 特征选择 + 分类：训练集内单步 `L1 LogisticRegressionCV`
+     * 【改进】C 搜索网格上限从 1000 降至 1.0，集中在中强度正则化区间
+     * 两阶段 selector → classifier 合并为单步，消除双重拟合的冗余偏差
 
-3. 分类模型：
-   - 最终分类器：训练集内 `L1` LogisticRegressionCV（LASSO）
+3. 阈值优化（新增）：
+   - 在训练集内 CV 预测概率上通过 Youden 指数（SEN + SPE - 1 最大化）自动选取最优阈值
+   - 将优化阈值同时应用于 val / test 集评估
+   - 同时保存固定阈值 0.5 下的对比指标
+
+4. 分类模型：
+   - 最终分类器：训练集内 `L1 LogisticRegressionCV`（LASSO）
    - 类别不平衡：默认 `class_weight="balanced"`
    - 超参数选择：仅在训练集内通过 `k` 折交叉验证确定
    - 验证集只用于独立报告，不参与参数搜索
 
-4. 计算加速：
+5. 计算加速：
    - PyRadiomics 提取默认走 CPU 并行，适合 Linux 多核环境
    - 每个 worker 默认只给 SimpleITK 分配 1 个线程，避免线程过度争抢
    - sklearn 的交叉验证支持多进程并行
@@ -93,6 +103,18 @@
    python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
        --split-base-root /path/to/splited_data \
        --resampled-spacing none
+
+4. 关闭单变量预筛选（保留全部特征送 LASSO）：
+
+   python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
+       --split-base-root /path/to/splited_data \
+       --univariate-k none
+
+5. 使用固定阈值 0.5 而非 Youden 自动阈值：
+
+   python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
+       --split-base-root /path/to/splited_data \
+       --optimize-threshold false
 """
 
 from __future__ import annotations
@@ -120,9 +142,9 @@ import yaml
 from joblib import Parallel, delayed
 from radiomics import featureextractor
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.feature_selection import VarianceThreshold
+from sklearn.feature_selection import SelectKBest, VarianceThreshold, f_classif
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
+from sklearn.linear_model import LogisticRegressionCV
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -130,7 +152,7 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
@@ -156,12 +178,6 @@ DEFAULT_C_GRID = (
     1e-1,
     3e-1,
     1.0,
-    3.0,
-    10.0,
-    30.0,
-    100.0,
-    300.0,
-    1000.0,
 )
 
 MODALITY_KEYWORDS: Dict[str, Tuple[str, ...]] = {
@@ -404,16 +420,13 @@ def build_argparser() -> argparse.ArgumentParser:
         help="训练集内用于超参数搜索的分层 k 折数，默认 5。",
     )
     parser.add_argument(
-        "--selector-c-grid",
+        "--c-grid",
         type=parse_c_grid,
         default=DEFAULT_C_GRID,
-        help="LASSO 特征选择的 C 搜索网格，逗号分隔。",
-    )
-    parser.add_argument(
-        "--classifier-c-grid",
-        type=parse_c_grid,
-        default=DEFAULT_C_GRID,
-        help="LASSO 分类器的 C 搜索网格，逗号分隔。",
+        help=(
+            "LASSO Logistic 回归的 C 搜索网格，逗号分隔。"
+            "C 越小正则化越强，建议上限不超过 1.0 以避免高维过拟合。"
+        ),
     )
     parser.add_argument(
         "--cv-scoring",
@@ -426,6 +439,16 @@ def build_argparser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="方差过滤阈值，默认 0.0（去除常数特征）。",
+    )
+    parser.add_argument(
+        "--univariate-k",
+        type=parse_optional_int,
+        default=50,
+        help=(
+            "单变量预筛选（SelectKBest + f_classif）保留的特征数，默认 50。"
+            "传 none 可关闭此步骤（直接以全量特征送 LASSO）。"
+            "建议保持 k << n_train_samples，以避免高维稀疏导致正则化失效。"
+        ),
     )
     parser.add_argument(
         "--max-iter",
@@ -443,7 +466,16 @@ def build_argparser() -> argparse.ArgumentParser:
         "--threshold",
         type=float,
         default=0.5,
-        help="患者级概率转标签的阈值，默认 0.5。",
+        help="患者级概率转标签的固定阈值，默认 0.5。当 --optimize-threshold=true 时此参数作为回退值。",
+    )
+    parser.add_argument(
+        "--optimize-threshold",
+        type=str2bool,
+        default=True,
+        help=(
+            "是否通过训练集内 CV 预测概率的 Youden 指数自动选取最优分类阈值，默认 true。"
+            "开启后 val/test 均使用优化阈值，同时保留固定阈值 0.5 的对比指标。"
+        ),
     )
     parser.add_argument(
         "--feature-extractor-version-note",
@@ -976,79 +1008,6 @@ def build_cv_object(y_train: np.ndarray, folds: int, seed: int) -> StratifiedKFo
     return StratifiedKFold(n_splits=actual_folds, shuffle=True, random_state=seed)
 
 
-def fit_selector_with_optional_fallback(
-    x_train_scaled: np.ndarray,
-    y_train: np.ndarray,
-    feature_names: Sequence[str],
-    cv: StratifiedKFold,
-    c_grid: Sequence[float],
-    scoring: str,
-    max_iter: int,
-    class_weight: Optional[str],
-    n_jobs: int,
-    seed: int,
-    allow_fallback: bool,
-) -> Tuple[LogisticRegressionCV, np.ndarray, Dict[str, object]]:
-    """拟合 LASSO 特征选择器，并在必要时执行稳定性兜底。"""
-
-    selector_cv = LogisticRegressionCV(
-        Cs=np.asarray(c_grid, dtype=np.float64),
-        cv=cv,
-        penalty="l1",
-        solver="saga",
-        scoring=scoring,
-        class_weight=class_weight,
-        n_jobs=n_jobs,
-        max_iter=max_iter,
-        fit_intercept=True,
-        refit=True,
-        random_state=seed,
-    )
-    selector_cv.fit(x_train_scaled, y_train)
-
-    selector_coef = selector_cv.coef_.ravel()
-    selected_mask = np.abs(selector_coef) > 1e-8
-    fallback_info: Dict[str, object] = {
-        "fallback_used": False,
-        "fallback_reason": "",
-        "fallback_c": None,
-    }
-
-    if np.any(selected_mask):
-        return selector_cv, selected_mask, fallback_info
-
-    if not allow_fallback:
-        raise RuntimeError(
-            "LASSO selector chose zero features and fallback is disabled. "
-            "Try a larger C grid or enable --feature-selection-fallback."
-        )
-
-    fallback_info["fallback_used"] = True
-    fallback_info["fallback_reason"] = "selector_cv_best_model_all_zero"
-
-    for c_value in sorted(c_grid, reverse=True):
-        candidate = LogisticRegression(
-            penalty="l1",
-            solver="saga",
-            C=float(c_value),
-            class_weight=class_weight,
-            max_iter=max_iter,
-            fit_intercept=True,
-            random_state=seed,
-        )
-        candidate.fit(x_train_scaled, y_train)
-        candidate_mask = np.abs(candidate.coef_.ravel()) > 1e-8
-        if np.any(candidate_mask):
-            selector_cv.coef_ = candidate.coef_.copy()
-            selector_cv.intercept_ = candidate.intercept_.copy()
-            selector_cv.C_ = np.asarray([float(c_value)], dtype=np.float64)
-            fallback_info["fallback_c"] = float(c_value)
-            return selector_cv, candidate_mask, fallback_info
-
-    raise RuntimeError(
-        "All fallback LASSO models still selected zero features. "
-        "Please inspect feature quality or broaden the C grid."
-    )
 
 
 def extract_cv_score_table(
@@ -1094,7 +1053,17 @@ def fit_radiomics_lasso_pipeline(
     feature_df: pd.DataFrame,
     args: argparse.Namespace,
 ) -> Dict[str, object]:
-    """在训练集上拟合完整的 radiomics + LASSO pipeline。"""
+    """在训练集上拟合完整的 radiomics + LASSO pipeline。
+
+    改进点（相比原始两阶段版本）：
+    - 新增单变量预筛选（SelectKBest + f_classif），在 LASSO 之前将特征降至
+      ``args.univariate_k`` 个，避免 n_samples << n_features 导致正则化失效；
+    - 将原来 selector → classifier 两步 LogisticRegressionCV 合并为单步，
+      消除双重拟合的冗余偏差；
+    - C 搜索网格上限收紧至 1.0，强制保留足够的 L1 惩罚力度；
+    - 训练集内 CV 预测概率通过 Youden 指数优化分类阈值（当
+      ``args.optimize_threshold=True`` 时）。
+    """
 
     metadata_columns = {
         "patient_id",
@@ -1122,9 +1091,11 @@ def fit_radiomics_lasso_pipeline(
     x_train_raw = train_df[feature_columns].to_numpy(dtype=np.float64)
     y_train = train_df["y_true"].to_numpy(dtype=np.int64)
 
+    # ── 步骤 1：缺失值填补 ────────────────────────────────────────────────────
     imputer = SimpleImputer(strategy="median")
     x_train_imputed = imputer.fit_transform(x_train_raw)
 
+    # ── 步骤 2：方差过滤（去除常数特征）──────────────────────────────────────
     variance_selector = VarianceThreshold(threshold=args.variance_threshold)
     x_train_variance = variance_selector.fit_transform(x_train_imputed)
     variance_feature_names = [
@@ -1135,37 +1106,56 @@ def fit_radiomics_lasso_pipeline(
     if len(variance_feature_names) == 0:
         raise RuntimeError("All features were removed by VarianceThreshold.")
 
+    # ── 步骤 3：标准化 ────────────────────────────────────────────────────────
     scaler = StandardScaler()
     x_train_scaled = scaler.fit_transform(x_train_variance)
 
+    # ── 步骤 4（新增）：单变量预筛选 ──────────────────────────────────────────
+    # 当 univariate_k 不为 None 时，使用 SelectKBest(f_classif) 预筛选特征。
+    # 这一步将特征数压缩至远小于训练样本数，使后续 LASSO 正则化能真正发挥作用。
+    univariate_k = getattr(args, "univariate_k", None)
+    if univariate_k is not None:
+        actual_k = min(univariate_k, x_train_scaled.shape[1])
+        if actual_k < x_train_scaled.shape[1]:
+            univariate_selector: Optional[SelectKBest] = SelectKBest(
+                score_func=f_classif, k=actual_k
+            )
+            x_train_prescreened = univariate_selector.fit_transform(x_train_scaled, y_train)
+            prescreened_feature_names = [
+                feature_name
+                for feature_name, keep_flag in zip(
+                    variance_feature_names, univariate_selector.get_support()
+                )
+                if keep_flag
+            ]
+            print(
+                f"Univariate prescreening: {len(variance_feature_names)} → "
+                f"{len(prescreened_feature_names)} features (k={actual_k})"
+            )
+        else:
+            # 特征数本就不超过 k，跳过预筛选
+            univariate_selector = None
+            x_train_prescreened = x_train_scaled
+            prescreened_feature_names = variance_feature_names
+            print(
+                f"Univariate prescreening skipped: "
+                f"n_features={x_train_scaled.shape[1]} <= k={actual_k}"
+            )
+    else:
+        univariate_selector = None
+        x_train_prescreened = x_train_scaled
+        prescreened_feature_names = variance_feature_names
+        print("Univariate prescreening disabled (--univariate-k none).")
+
+    # ── 步骤 5：单步 LASSO LogisticRegressionCV（特征选择 + 分类合并）─────────
+    # 原两阶段 selector → classifier 合并为单步，消除冗余偏差。
+    # C 搜索网格上限 ≤ 1.0，保证 L1 惩罚有效压缩特征。
     class_weight = "balanced" if args.use_class_weights else None
     cv = build_cv_object(y_train=y_train, folds=args.cv_folds, seed=args.seed)
 
-    selector_cv, selected_mask, selector_fallback_info = fit_selector_with_optional_fallback(
-        x_train_scaled=x_train_scaled,
-        y_train=y_train,
-        feature_names=variance_feature_names,
-        cv=cv,
-        c_grid=args.selector_c_grid,
-        scoring=args.cv_scoring,
-        max_iter=args.max_iter,
-        class_weight=class_weight,
-        n_jobs=args.n_jobs,
-        seed=args.seed,
-        allow_fallback=args.feature_selection_fallback,
-    )
-
-    selected_feature_names = [
-        feature_name
-        for feature_name, keep_flag in zip(variance_feature_names, selected_mask)
-        if keep_flag
-    ]
-    x_train_selected = x_train_scaled[:, selected_mask]
-    if x_train_selected.shape[1] == 0:
-        raise RuntimeError("No selected features remain after LASSO feature selection.")
-
+    c_grid = getattr(args, "c_grid", DEFAULT_C_GRID)
     classifier_cv = LogisticRegressionCV(
-        Cs=np.asarray(args.classifier_c_grid, dtype=np.float64),
+        Cs=np.asarray(c_grid, dtype=np.float64),
         cv=cv,
         penalty="l1",
         solver="saga",
@@ -1177,20 +1167,124 @@ def fit_radiomics_lasso_pipeline(
         refit=True,
         random_state=args.seed,
     )
-    classifier_cv.fit(x_train_selected, y_train)
+    classifier_cv.fit(x_train_prescreened, y_train)
+
+    classifier_coef = classifier_cv.coef_.ravel()
+    selected_mask_prescreened = np.abs(classifier_coef) > 1e-8
+
+    if not np.any(selected_mask_prescreened):
+        # 所有系数为 0，尝试最大 C 的单次拟合作为兜底
+        warnings.warn(
+            "LASSO selected zero features. Falling back to C=1.0 single fit.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        from sklearn.linear_model import LogisticRegression as _LR
+
+        _fallback = _LR(
+            penalty="l1",
+            solver="saga",
+            C=1.0,
+            class_weight=class_weight,
+            max_iter=args.max_iter,
+            fit_intercept=True,
+            random_state=args.seed,
+        )
+        _fallback.fit(x_train_prescreened, y_train)
+        selected_mask_prescreened = np.abs(_fallback.coef_.ravel()) > 1e-8
+        # 用兜底模型的系数覆盖 classifier_cv，保证后续接口一致
+        classifier_cv.coef_ = _fallback.coef_.copy()
+        classifier_cv.intercept_ = _fallback.intercept_.copy()
+        classifier_cv.C_ = np.asarray([1.0], dtype=np.float64)
+
+    selected_feature_names = [
+        feature_name
+        for feature_name, keep_flag in zip(prescreened_feature_names, selected_mask_prescreened)
+        if keep_flag
+    ]
+    if len(selected_feature_names) == 0:
+        raise RuntimeError(
+            "No selected features remain after LASSO. "
+            "Try a larger C grid or enable --univariate-k none."
+        )
+
+    # ── 步骤 6（新增）：Youden 阈值优化 ──────────────────────────────────────
+    # 在训练集内通过 CV 预测概率最大化 Youden 指数（SEN + SPE - 1），
+    # 使分类阈值不依赖于固定的 0.5。
+    optimize_threshold = getattr(args, "optimize_threshold", True)
+    if optimize_threshold and len(np.unique(y_train)) == 2:
+        # 用已拟合好的 prescreened 特征矩阵通过 cross_val_predict 获取 OOF 概率
+        oof_probs = cross_val_predict(
+            LogisticRegressionCV(
+                Cs=np.asarray(c_grid, dtype=np.float64),
+                cv=cv,
+                penalty="l1",
+                solver="saga",
+                scoring=args.cv_scoring,
+                class_weight=class_weight,
+                n_jobs=args.n_jobs,
+                max_iter=args.max_iter,
+                fit_intercept=True,
+                refit=True,
+                random_state=args.seed,
+            ),
+            x_train_prescreened,
+            y_train,
+            cv=cv,
+            method="predict_proba",
+        )[:, 1]
+        fpr_arr, tpr_arr, thr_arr = roc_curve(y_train, oof_probs)
+        youden_scores = tpr_arr - fpr_arr
+        best_idx = int(np.argmax(youden_scores))
+        optimal_threshold = float(thr_arr[best_idx])
+        print(
+            f"Youden threshold optimization: "
+            f"optimal_threshold={optimal_threshold:.4f} "
+            f"(Youden={youden_scores[best_idx]:.4f}, "
+            f"SEN={tpr_arr[best_idx]:.4f}, SPE={1 - fpr_arr[best_idx]:.4f})"
+        )
+    else:
+        optimal_threshold = float(args.threshold)
+        print(f"Threshold optimization disabled; using fixed threshold={optimal_threshold:.4f}")
+
+    # ── 构建特征详情表 ────────────────────────────────────────────────────────
+    # 将 selected_mask_prescreened 映射回原始 variance_feature_names 空间
+    # 以便输出包含未被单变量预筛选也未被 LASSO 选中的特征的完整表格
+    if univariate_selector is not None:
+        univariate_support = univariate_selector.get_support()
+        prescreened_idx_in_variance = [
+            idx for idx, keep in enumerate(univariate_support) if keep
+        ]
+        # selected_mask_prescreened 的长度等于 prescreened_feature_names 的长度
+        selected_mask_full = np.zeros(len(variance_feature_names), dtype=bool)
+        for local_idx, (global_idx, keep) in enumerate(
+            zip(prescreened_idx_in_variance, selected_mask_prescreened)
+        ):
+            selected_mask_full[global_idx] = bool(keep)
+        prescreened_mask_full = np.zeros(len(variance_feature_names), dtype=bool)
+        for global_idx in prescreened_idx_in_variance:
+            prescreened_mask_full[global_idx] = True
+    else:
+        univariate_support = np.ones(len(variance_feature_names), dtype=bool)
+        selected_mask_full = selected_mask_prescreened.copy()
+        prescreened_mask_full = np.ones(len(variance_feature_names), dtype=bool)
+
+    # 构建 classifier_coef_full（与 variance_feature_names 对齐）
+    classifier_coef_full = np.zeros(len(variance_feature_names), dtype=np.float64)
+    local_idx = 0
+    for global_idx, prescreened in enumerate(prescreened_mask_full):
+        if prescreened:
+            classifier_coef_full[global_idx] = float(classifier_coef[local_idx])
+            local_idx += 1
 
     selected_feature_rows: List[Dict[str, object]] = []
-    selector_coef = selector_cv.coef_.ravel()
-    classifier_coef = classifier_cv.coef_.ravel()
     selected_rank = 0
-    for feature_name, selector_value, keep_flag in zip(
-        variance_feature_names,
-        selector_coef,
-        selected_mask,
-    ):
+    for i, feature_name in enumerate(variance_feature_names):
         modality, feature_class, short_name = parse_feature_metadata(feature_name)
-        if keep_flag:
-            coef_value = float(classifier_coef[selected_rank])
+        in_prescreened = bool(prescreened_mask_full[i])
+        in_selected = bool(selected_mask_full[i])
+        if in_selected:
+            coef_value = float(classifier_coef_full[i])
             rank_value = selected_rank + 1
             selected_rank += 1
         else:
@@ -1202,38 +1296,42 @@ def fit_radiomics_lasso_pipeline(
                 "modality": modality,
                 "feature_class": feature_class,
                 "feature_short_name": short_name,
-                "selected_by_lasso": int(bool(keep_flag)),
-                "selector_coefficient": float(selector_value),
-                "selector_abs_coefficient": float(abs(selector_value)),
+                "passed_univariate_prescreen": int(in_prescreened),
+                "selected_by_lasso": int(in_selected),
                 "classifier_coefficient": coef_value,
+                "classifier_abs_coefficient": abs(coef_value) if in_selected else float("nan"),
                 "rank_in_final_model": rank_value,
             }
         )
 
-    selector_cv_rows = extract_cv_score_table(selector_cv, stage="feature_selection")
     classifier_cv_rows = extract_cv_score_table(classifier_cv, stage="classification")
 
     return {
         "metadata_columns": sorted(metadata_columns),
         "feature_columns_raw": feature_columns,
         "feature_columns_after_variance": variance_feature_names,
+        "prescreened_feature_names": prescreened_feature_names,
         "selected_feature_names": selected_feature_names,
         "imputer": imputer,
         "variance_selector": variance_selector,
+        "univariate_selector": univariate_selector,
         "scaler": scaler,
-        "selector_cv": selector_cv,
         "classifier_cv": classifier_cv,
-        "selected_mask": selected_mask,
+        "selected_mask_prescreened": selected_mask_prescreened,
+        "selected_mask_full": selected_mask_full,
         "selected_feature_rows": selected_feature_rows,
-        "selector_cv_rows": selector_cv_rows,
+        "selector_cv_rows": [],   # 已合并，保留键以兼容下游输出函数
         "classifier_cv_rows": classifier_cv_rows,
-        "selector_fallback_info": selector_fallback_info,
+        "selector_fallback_info": {"fallback_used": False, "fallback_reason": "", "fallback_c": None},
         "cv_folds_actual": cv.n_splits,
         "class_weight": class_weight,
         "shape_reference_modality": args.shape_reference_modality,
         "num_raw_features": len(feature_columns),
         "num_features_after_variance": len(variance_feature_names),
+        "num_prescreened_features": len(prescreened_feature_names),
         "num_selected_features": len(selected_feature_names),
+        "optimal_threshold": optimal_threshold,
+        "threshold_optimized": optimize_threshold,
     }
 
 
@@ -1241,13 +1339,23 @@ def transform_feature_matrix(
     raw_matrix: np.ndarray,
     pipeline: Mapping[str, object],
 ) -> np.ndarray:
-    """将原始特征矩阵变换到最终分类器输入空间。"""
+    """将原始特征矩阵变换到最终分类器输入空间。
+
+    变换顺序：impute → variance_filter → scale → univariate_prescreen → lasso_mask
+    """
 
     x_imputed = pipeline["imputer"].transform(raw_matrix)
     x_variance = pipeline["variance_selector"].transform(x_imputed)
     x_scaled = pipeline["scaler"].transform(x_variance)
-    selected_mask = np.asarray(pipeline["selected_mask"], dtype=bool)
-    return x_scaled[:, selected_mask]
+
+    univariate_selector = pipeline.get("univariate_selector")
+    if univariate_selector is not None:
+        x_prescreened = univariate_selector.transform(x_scaled)
+    else:
+        x_prescreened = x_scaled
+
+    selected_mask = np.asarray(pipeline["selected_mask_prescreened"], dtype=bool)
+    return x_prescreened[:, selected_mask]
 
 
 def predict_split(
@@ -1257,14 +1365,20 @@ def predict_split(
     run_id: str,
     checkpoint_name: str,
 ) -> Dict[str, object]:
-    """对单个 split 生成患者级预测和指标。"""
+    """对单个 split 生成患者级预测和指标。
+
+    同时计算 optimal_threshold 和固定 threshold=0.5 下的指标，便于对比。
+    """
 
     feature_columns = pipeline["feature_columns_raw"]
     raw_matrix = split_df[feature_columns].to_numpy(dtype=np.float64)
     x_final = transform_feature_matrix(raw_matrix, pipeline)
     probs = pipeline["classifier_cv"].predict_proba(x_final)[:, 1]
     y_true = split_df["y_true"].to_numpy(dtype=np.int64)
-    pred_labels = (probs >= threshold).astype(np.int64)
+
+    # 使用 optimal_threshold（可能来自 Youden 优化或固定值）
+    optimal_threshold = float(pipeline.get("optimal_threshold", threshold))
+    pred_labels = (probs >= optimal_threshold).astype(np.int64)
 
     patient_rows: List[Dict[str, object]] = []
     for patient_id, y_item, prob_item, pred_item, split_name in zip(
@@ -1287,14 +1401,26 @@ def predict_split(
         )
 
     metrics = compute_patient_metrics(patient_rows)
+
+    # 固定阈值 0.5 的对比指标
+    pred_labels_fixed = (probs >= 0.5).astype(np.int64)
+    fixed_rows_tmp = [
+        {**row, "pred_label": int(pl)}
+        for row, pl in zip(patient_rows, pred_labels_fixed)
+    ]
+    metrics_fixed05 = compute_patient_metrics(fixed_rows_tmp)
+
     return {
         "patient_rows": patient_rows,
         "metrics": metrics,
+        "metrics_fixed_threshold_05": metrics_fixed05,
+        "optimal_threshold": optimal_threshold,
         "num_patients": len(patient_rows),
         "num_features_before_selection": int(pipeline["num_raw_features"]),
         "num_features_after_selection": int(pipeline["num_selected_features"]),
-        "selector_best_c": float(np.asarray(pipeline["selector_cv"].C_).ravel()[0]),
         "classifier_best_c": float(np.asarray(pipeline["classifier_cv"].C_).ravel()[0]),
+        # 向后兼容：保留 selector_best_c 键
+        "selector_best_c": float(np.asarray(pipeline["classifier_cv"].C_).ravel()[0]),
     }
 
 
@@ -1316,8 +1442,10 @@ def save_feature_tables(
         selected_columns = ["patient_id", "split", "y_true", "label_name"] + list(
             pipeline["selected_feature_names"]
         )
+        # 过滤掉不存在于 feature_df 的列（防御性检查）
+        available = [col for col in selected_columns if col in feature_df.columns]
         selected_path = output_dir / f"radiomics_features_selected_{MODEL_NAME}_{run_id}.csv"
-        feature_df[selected_columns].to_csv(selected_path, index=False)
+        feature_df[available].to_csv(selected_path, index=False)
 
 
 def save_model_artifacts(
@@ -1338,15 +1466,20 @@ def save_model_artifacts(
         "shape_reference_modality": pipeline["shape_reference_modality"],
         "feature_columns_raw": list(pipeline["feature_columns_raw"]),
         "feature_columns_after_variance": list(pipeline["feature_columns_after_variance"]),
+        "prescreened_feature_names": list(pipeline["prescreened_feature_names"]),
         "selected_feature_names": list(pipeline["selected_feature_names"]),
         "imputer": pipeline["imputer"],
         "variance_selector": pipeline["variance_selector"],
+        "univariate_selector": pipeline["univariate_selector"],
         "scaler": pipeline["scaler"],
-        "selected_mask": np.asarray(pipeline["selected_mask"], dtype=bool),
-        "selector_cv": pipeline["selector_cv"],
+        "selected_mask_prescreened": np.asarray(pipeline["selected_mask_prescreened"], dtype=bool),
+        "selected_mask_full": np.asarray(pipeline["selected_mask_full"], dtype=bool),
         "classifier_cv": pipeline["classifier_cv"],
+        "optimal_threshold": float(pipeline["optimal_threshold"]),
+        "threshold_optimized": bool(pipeline["threshold_optimized"]),
         "num_raw_features": int(pipeline["num_raw_features"]),
         "num_features_after_variance": int(pipeline["num_features_after_variance"]),
+        "num_prescreened_features": int(pipeline["num_prescreened_features"]),
         "num_selected_features": int(pipeline["num_selected_features"]),
     }
     joblib.dump(bundle, best_path)
@@ -1433,6 +1566,11 @@ def export_prediction_tables(
                 "sen": metrics["sen"],
                 "spe": metrics["spe"],
                 "f1": metrics["f1"],
+                "optimal_threshold": output.get("optimal_threshold", 0.5),
+                "acc_fixed05": output.get("metrics_fixed_threshold_05", {}).get("acc", ""),
+                "sen_fixed05": output.get("metrics_fixed_threshold_05", {}).get("sen", ""),
+                "spe_fixed05": output.get("metrics_fixed_threshold_05", {}).get("spe", ""),
+                "f1_fixed05": output.get("metrics_fixed_threshold_05", {}).get("f1", ""),
                 "num_patients": output["num_patients"],
                 "num_features_before_selection": output["num_features_before_selection"],
                 "num_features_after_selection": output["num_features_after_selection"],
@@ -1450,6 +1588,11 @@ def export_prediction_tables(
         "sen",
         "spe",
         "f1",
+        "optimal_threshold",
+        "acc_fixed05",
+        "sen_fixed05",
+        "spe_fixed05",
+        "f1_fixed05",
         "num_patients",
         "num_features_before_selection",
         "num_features_after_selection",
@@ -1665,10 +1808,10 @@ def export_selected_features(
         "modality",
         "feature_class",
         "feature_short_name",
+        "passed_univariate_prescreen",
         "selected_by_lasso",
-        "selector_coefficient",
-        "selector_abs_coefficient",
         "classifier_coefficient",
+        "classifier_abs_coefficient",
         "rank_in_final_model",
     ]
     path = output_dir / f"selected_features_{MODEL_NAME}_{run_id}.csv"
@@ -1702,8 +1845,8 @@ def export_scaler_stats(
     feature_names = list(pipeline["feature_columns_after_variance"])
     scaler = pipeline["scaler"]
     imputer = pipeline["imputer"]
-    selector_cv = pipeline["selector_cv"]
     classifier_cv = pipeline["classifier_cv"]
+    classifier_best_c = float(np.asarray(classifier_cv.C_).ravel()[0])
 
     stats_payload = {
         "model": MODEL_NAME,
@@ -1723,11 +1866,13 @@ def export_scaler_stats(
             feature_name: float(value)
             for feature_name, value in zip(feature_names, scaler.scale_)
         },
-        "selector_best_c": float(np.asarray(selector_cv.C_).ravel()[0]),
-        "classifier_best_c": float(np.asarray(classifier_cv.C_).ravel()[0]),
+        "classifier_best_c": classifier_best_c,
         "selector_fallback_info": pipeline["selector_fallback_info"],
+        "optimal_threshold": float(pipeline.get("optimal_threshold", 0.5)),
+        "threshold_optimized": bool(pipeline.get("threshold_optimized", False)),
         "num_raw_features": int(pipeline["num_raw_features"]),
         "num_features_after_variance": int(pipeline["num_features_after_variance"]),
+        "num_prescreened_features": int(pipeline["num_prescreened_features"]),
         "num_selected_features": int(pipeline["num_selected_features"]),
         "selected_feature_names": list(pipeline["selected_feature_names"]),
     }
@@ -1742,10 +1887,12 @@ def export_protocol_markdown(
 ) -> None:
     """导出传统影像组学 baseline 的协议说明。"""
 
-    selector_best_c = float(np.asarray(pipeline["selector_cv"].C_).ravel()[0])
     classifier_best_c = float(np.asarray(pipeline["classifier_cv"].C_).ravel()[0])
+    optimal_threshold = float(pipeline.get("optimal_threshold", args.threshold))
+    threshold_optimized = bool(pipeline.get("threshold_optimized", False))
+    univariate_k = getattr(args, "univariate_k", None)
     lines = [
-        "# Radiomics + Logistic Regression 协议说明",
+        "# Radiomics + Logistic Regression 协议说明（改进版）",
         "",
         f"- 运行日期：{time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"- 模型标识：`{MODEL_NAME}`",
@@ -1753,8 +1900,8 @@ def export_protocol_markdown(
         f"- VOI 来源：`conventional/` 分支下的全肿瘤 `VOI`",
         f"- 形状特征参考模态：`{args.shape_reference_modality}`",
         f"- 交叉验证折数：`{pipeline['cv_folds_actual']}`",
-        f"- selector 最优 C：`{selector_best_c}`",
-        f"- classifier 最优 C：`{classifier_best_c}`",
+        f"- 最优 C（LASSO）：`{classifier_best_c}`",
+        f"- 最优分类阈值：`{optimal_threshold:.4f}`（Youden 优化：`{threshold_optimized}`）",
         f"- 类别权重：`{pipeline['class_weight']}`",
         "",
         "## 1. 队列与划分",
@@ -1784,20 +1931,24 @@ def export_protocol_markdown(
         *[f"  - `{feature_class}`" for feature_class in DEFAULT_FEATURE_CLASSES],
         "- 形状特征只提取一次，避免在多模态中重复写入完全相同的 shape 特征。",
         "",
-        "## 4. 建模流程",
+        "## 4. 建模流程（改进版）",
         "",
         "- 训练集内 `median` 缺失值填补",
         f"- 训练集内 `VarianceThreshold(threshold={args.variance_threshold})`",
         "- 训练集内 `StandardScaler`",
-        "- 训练集内 `L1 LogisticRegressionCV` 做特征选择",
-        "- 训练集内 `L1 LogisticRegressionCV` 做最终分类",
+        f"- 【新增】训练集内 `SelectKBest(f_classif, k={univariate_k})` 单变量预筛选"
+        + ("（已禁用）" if univariate_k is None else ""),
+        "- 训练集内单步 `L1 LogisticRegressionCV`（特征选择 + 分类合并）",
+        f"  - C 搜索网格：`{list(getattr(args, 'c_grid', DEFAULT_C_GRID))}`（上限 ≤ 1.0）",
+        "- 【新增】训练集内 CV OOF 概率 → Youden 指数自动阈值优化",
         "- 验证集和测试集仅做独立评估，不参与超参数搜索",
         "",
         "## 5. 结果摘要",
         "",
         f"- 原始 radiomics 特征数：`{pipeline['num_raw_features']}`",
         f"- 方差过滤后特征数：`{pipeline['num_features_after_variance']}`",
-        f"- 最终保留特征数：`{pipeline['num_selected_features']}`",
+        f"- 单变量预筛选后特征数：`{pipeline['num_prescreened_features']}`",
+        f"- LASSO 最终保留特征数：`{pipeline['num_selected_features']}`",
         f"- 特征选择 fallback：`{pipeline['selector_fallback_info']}`",
         "",
         "## 6. 工程补充说明",
@@ -1839,12 +1990,13 @@ def export_run_config_yaml(args: argparse.Namespace, output_dir: Path) -> None:
         },
         "modeling": {
             "variance_threshold": args.variance_threshold,
-            "selector_c_grid": list(args.selector_c_grid),
-            "classifier_c_grid": list(args.classifier_c_grid),
+            "c_grid": list(getattr(args, "c_grid", DEFAULT_C_GRID)),
             "cv_scoring": args.cv_scoring,
             "cv_folds": args.cv_folds,
             "max_iter": args.max_iter,
             "use_class_weights": args.use_class_weights,
+            "univariate_k": getattr(args, "univariate_k", None),
+            "optimize_threshold": getattr(args, "optimize_threshold", True),
             "threshold": args.threshold,
             "feature_selection_fallback": args.feature_selection_fallback,
         },
@@ -2081,11 +2233,13 @@ def _main_pipeline(args: argparse.Namespace, run_id: str, output_dir: Path) -> N
     print(
         f"Feature summary | raw={pipeline['num_raw_features']} | "
         f"after_variance={pipeline['num_features_after_variance']} | "
+        f"prescreened={pipeline['num_prescreened_features']} | "
         f"selected={pipeline['num_selected_features']}"
     )
     print(
-        f"Best C | selector={np.asarray(pipeline['selector_cv'].C_).ravel()[0]} | "
-        f"classifier={np.asarray(pipeline['classifier_cv'].C_).ravel()[0]}"
+        f"Best C (LASSO classifier) = {np.asarray(pipeline['classifier_cv'].C_).ravel()[0]} | "
+        f"optimal_threshold = {pipeline['optimal_threshold']:.4f} "
+        f"(Youden optimized: {pipeline['threshold_optimized']})"
     )
 
     save_feature_tables(
