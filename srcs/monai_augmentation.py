@@ -166,7 +166,10 @@ def build_monai_block_transforms(
                 keys=["image"],
                 factors=float(config.intensity_scale),
                 prob=config.intensity_scale_prob,
-                channel_wise=False,
+                # channel_wise=True：对每个通道独立随机缩放强度。
+                # 原值 False 会混合所有 35 通道（含 VOI mask 通道）的统计量，
+                # 导致 mask 通道（值为 0/1）污染 MRI 强度扰动范围，应改为 True。
+                channel_wise=True,
             )
         )
 
@@ -177,7 +180,11 @@ def build_monai_block_transforms(
                 factors=float(config.intensity_shift),
                 prob=config.intensity_shift_prob,
                 nonzero=True,
-                channel_wise=False,
+                # channel_wise=True：对每个通道独立计算标准差并随机偏移。
+                # 原值 False 会将全部 35 个通道拼合后统一计算 std，
+                # VOI mask 的 0/1 值会显著拉低整体 std，使得实际偏移量偏小，
+                # 且各通道间的强度分布差异被抹平，改为 True 后每通道独立扰动更合理。
+                channel_wise=True,
             )
         )
 

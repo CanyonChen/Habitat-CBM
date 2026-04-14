@@ -108,13 +108,15 @@ ResNet-18 基线训练脚本，用于病人级别的 IDH 突变状态预测。
 
 --lr (float)
     AdamW 优化器的学习率。
-    默认值: 5e-4
+    默认值: 1e-4
     可用范围: 建议 1e-5 ~ 1e-3
+    说明: 配合 cosine 调度器在小数据集上更稳定，比 5e-4 更不容易过拟合。
 
 --weight-decay (float)
     AdamW 的权重衰减系数（L2 正则化）。
-    默认值: 1e-4
-    可用范围: 建议 1e-5 ~ 1e-3
+    默认值: 1e-3
+    可用范围: 建议 1e-4 ~ 1e-2
+    说明: 提升至 1e-3 可增强正则化强度，有效抑制过拟合。
 
 --num-workers (int)
     DataLoader 使用的并行加载进程数。
@@ -149,16 +151,18 @@ ResNet-18 基线训练脚本，用于病人级别的 IDH 突变状态预测。
 
 --early-stop-patience (int)
     验证集 AUC 连续多少个 epoch 没有提升时触发早停。
-    默认值: 5
-    说明: 设为 0 可禁用早停；建议值: 5 ~ 15。
+    默认值: 20
+    说明: 设为 0 可禁用早停；14 人验证集的 AUC 最小分辨率约 0.0156，
+          patience=5 会过早停止，建议使用 15 ~ 30。
 
 --early-stop-min-delta (float)
     判定为"有效提升"的最小阈值（验证集监控指标的提升幅度）。
-    默认值: 0.001
+    默认值: 0.005
     可用范围: [0.0, 1.0]
     说明: 只有当验证集 AUC 的提升 > min_delta 时，才认为是有效改进。
-          用于过滤微小波动，避免过拟合；设为 0 则任何提升都算改进。
-          建议值: 0.0001 ~ 0.01 (AUC 是 0-1 范围，0.001 约等于 0.1% 提升)。
+          14 人验证集 AUC 最小分辨率 ≈ 0.0156，将 delta 设为 0.005 相当于
+          要求改进超过最小单位的 1/3，既能过滤随机波动又不过于严苛。
+          设为 0 则任何提升都算改进。
 
 --save-train-predictions (bool)
     是否额外导出训练集上的病人级预测结果。
@@ -188,6 +192,32 @@ ResNet-18 基线训练脚本，用于病人级别的 IDH 突变状态预测。
     每隔多少个 epoch 保存一个周期性 checkpoint。
     默认值: 50
     说明: 设为 0 可禁用周期性保存。最终评估仍使用 best checkpoint。
+
+--dropout-p (float)
+    ResNet-18 分类头前 Dropout 层的 dropout 概率。
+    默认值: 0.5
+    可用范围: [0.0, 1.0)
+    说明: 设为 0.0 则不添加 Dropout 层；对于训练块数远多于验证患者数的情况
+          （如约 6000 blocks vs 14 名患者），Dropout 可显著抑制过拟合。
+          建议范围: 0.3 ~ 0.5。
+
+--label-smoothing (float)
+    CrossEntropyLoss 的 label smoothing 系数。
+    默认值: 0.1
+    可用范围: [0.0, 1.0)
+    说明: 将 one-hot 标签软化为 (1 - ε) 和 ε / (C-1)，防止模型过于自信；
+          对小样本医学影像分类有正则化效果。设为 0.0 则使用标准交叉熵。
+
+--lr-scheduler (str)
+    学习率调度策略。
+    默认值: cosine
+    可用选项:
+      none   - 不使用调度器，学习率全程固定。
+      cosine - CosineAnnealingLR，将 lr 从初始值余弦退火至 eta_min=1e-6。
+               适合大多数场景，训练后期平滑降低 lr 避免震荡。
+      plateau - ReduceLROnPlateau(mode='max', factor=0.5, patience=5)，
+                当验证 AUC 连续 5 epoch 没有提升时，将 lr 缩减为原来的 50%。
+                适合训练曲线震荡较大的情况。
 
 ================================================================================
 Checkpoint 保存策略
@@ -286,16 +316,20 @@ Checkpoint 保存策略
        --min-nonzero-voxels 16 \
        --cache-volumes true \
        --batch-size 16 \
-       --epochs 50 \
+       --epochs 100 \
        --lr 1e-4 \
-       --weight-decay 1e-4 \
+       --weight-decay 1e-3 \
        --num-workers 4 \
        --seed 42 \
        --pretrained true \
        --resize-height 224 \
        --resize-width 224 \
        --use-class-weights true \
-       --early-stop-patience 10 \
+       --early-stop-patience 20 \
+       --early-stop-min-delta 0.005 \
+       --dropout-p 0.5 \
+       --label-smoothing 0.1 \
+       --lr-scheduler cosine \
        --save-train-predictions true \
        --device cuda \
        --threshold 0.5 \
@@ -317,19 +351,34 @@ Checkpoint 保存策略
        --save-interval 0 \
        --run-id minimal_checkpoints
 
-10. 严格早停（需要至少 0.1% 的 AUC 提升才算改进）：
+10. 严格早停（需要至少 0.5% 的 AUC 提升才算改进）：
    
    python habitat_CBM/repo/srcs/baseline_ResNet18.py \
-       --early-stop-patience 8 \
-       --early-stop-min-delta 0.001 \
+       --early-stop-patience 20 \
+       --early-stop-min-delta 0.005 \
        --run-id strict_early_stop
 
 11. 宽松早停（微小提升也算有效）：
    
    python habitat_CBM/repo/srcs/baseline_ResNet18.py \
-       --early-stop-patience 8 \
+       --early-stop-patience 30 \
        --early-stop-min-delta 0.0 \
        --run-id loose_early_stop
+
+12. 禁用正则化（对照实验）：
+   
+   python habitat_CBM/repo/srcs/baseline_ResNet18.py \
+       --dropout-p 0.0 \
+       --label-smoothing 0.0 \
+       --lr-scheduler none \
+       --run-id ablation_no_regularization
+
+13. 使用 ReduceLROnPlateau 调度器（适合震荡场景）：
+   
+   python habitat_CBM/repo/srcs/baseline_ResNet18.py \
+       --lr-scheduler plateau \
+       --lr 5e-4 \
+       --run-id exp_plateau_scheduler
 """
 
 from __future__ import annotations
@@ -579,8 +628,18 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--batch-size", type=int, default=16, help="Mini-batch size.")
     parser.add_argument("--epochs", type=int, default=200, help="Training epochs.")
-    parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate.")
-    parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay.")
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+        help="AdamW learning rate. Default 1e-4 (reduced from 5e-4) works better with cosine scheduler on small datasets.",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-3,
+        help="AdamW weight decay (L2 regularization). Default 1e-3 (increased from 1e-4) for stronger regularization.",
+    )
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers.")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Global random seed.")
     parser.add_argument(
@@ -610,14 +669,51 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--early-stop-patience",
         type=int,
-        default=5,
-        help="Stop if validation AUC does not improve for N epochs.",
+        default=20,
+        help=(
+            "Stop if validation AUC does not improve for N epochs. "
+            "Default 20 (increased from 5) is more appropriate for a ~14-patient validation set "
+            "where the minimum AUC resolution is ~0.0156."
+        ),
     )
     parser.add_argument(
         "--early-stop-min-delta",
         type=float,
-        default=0.001,
-        help="Minimum change in validation score to qualify as an improvement for early stopping.",
+        default=0.005,
+        help=(
+            "Minimum change in validation score to qualify as an improvement for early stopping. "
+            "Default 0.005 (increased from 0.001) filters noise better given the small validation set."
+        ),
+    )
+    parser.add_argument(
+        "--dropout-p",
+        type=float,
+        default=0.5,
+        help=(
+            "Dropout probability applied before the final classification layer. "
+            "0.0 disables Dropout. Recommended range: 0.3–0.5 to combat overfitting "
+            "when training blocks (~6000) greatly outnumber validation patients (~14)."
+        ),
+    )
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.1,
+        help=(
+            "Label smoothing coefficient for CrossEntropyLoss (0.0 = standard cross-entropy). "
+            "Softens one-hot targets to prevent overconfident predictions on small datasets."
+        ),
+    )
+    parser.add_argument(
+        "--lr-scheduler",
+        choices=("none", "cosine", "plateau"),
+        default="cosine",
+        help=(
+            "Learning rate scheduler. "
+            "'cosine': CosineAnnealingLR (T_max=epochs, eta_min=1e-6), smoothly decays lr. "
+            "'plateau': ReduceLROnPlateau (mode=max, factor=0.5, patience=5), halves lr on stagnation. "
+            "'none': constant lr throughout training."
+        ),
     )
     parser.add_argument(
         "--save-train-predictions",
@@ -1504,6 +1600,9 @@ def export_run_config_yaml(args: argparse.Namespace, output_dir: Path) -> None:
             "use_class_weights": args.use_class_weights,
             "early_stop_patience": args.early_stop_patience,
             "early_stop_min_delta": args.early_stop_min_delta,
+            "dropout_p": args.dropout_p,
+            "label_smoothing": args.label_smoothing,
+            "lr_scheduler": args.lr_scheduler,
             "save_train_predictions": args.save_train_predictions,
             "save_interval": args.save_interval,
             "threshold": args.threshold,
@@ -1624,14 +1723,40 @@ def _main_training_loop(
         in_channels=in_channels,
         num_classes=2,
         pretrained=args.pretrained,
+        dropout_p=args.dropout_p,  # 分类头前 Dropout，用于抑制过拟合
     ).to(device)
 
     class_weights = None
     if args.use_class_weights:
         class_weights = compute_class_weights(datasets["train"], device)
-    # 使用带类别权重的交叉熵损失，优化器为 AdamW。
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    # CrossEntropyLoss 增加 label_smoothing，软化目标标签防止模型过于自信；
+    # 优化器为 AdamW，增大 weight_decay 至 1e-3 以加强 L2 正则化。
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=args.label_smoothing)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # 构建学习率调度器（可选）
+    # - cosine: 余弦退火，将 lr 从初始值平滑衰减至 eta_min=1e-6，适合大多数场景。
+    # - plateau: 当验证 AUC 停滞时将 lr 减半，适合训练曲线震荡场景。
+    # - none: 不使用调度器，全程固定学习率。
+    scheduler = None
+    if args.lr_scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+            eta_min=1e-6,
+        )
+        print(f"LR scheduler: CosineAnnealingLR (T_max={args.epochs}, eta_min=1e-6)")
+    elif args.lr_scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",       # 监控指标越大越好（val AUC）
+            factor=0.5,       # lr 乘以 0.5
+            patience=5,       # 连续 5 epoch 没有改进才降低 lr
+            min_lr=1e-6,
+        )
+        print("LR scheduler: ReduceLROnPlateau (mode=max, factor=0.5, patience=5, min_lr=1e-6)")
+    else:
+        print("LR scheduler: none (constant learning rate)")
 
     history: List[EpochStats] = []
     best_score = -float("inf")
@@ -1666,6 +1791,18 @@ def _main_training_loop(
 
         # 验证集指标以病人级别结果为准，用于选择最佳模型。
         metrics = val_output["metrics"]
+        current_score = choose_monitor_score(val_output)
+
+        # 更新学习率调度器：
+        # - plateau 调度器需要传入监控指标（val AUC），与 early stopping 共用同一分数；
+        # - cosine 调度器直接按 epoch 步进即可；
+        # - 在记录 current_lr 前调用，确保 history 中记录的是本 epoch 实际使用的 lr。
+        if scheduler is not None:
+            if args.lr_scheduler == "plateau":
+                scheduler.step(current_score)
+            else:
+                scheduler.step()
+
         current_lr = float(optimizer.param_groups[0]["lr"])
         history.append(
             EpochStats(
@@ -1682,7 +1819,6 @@ def _main_training_loop(
             )
         )
 
-        current_score = choose_monitor_score(val_output)
         # 改进判断：提升幅度必须超过阈值才算有效改进
         improved = (current_score - best_score) > args.early_stop_min_delta
         delta_str = f"(+{current_score - best_score:.6f})" if improved else f"({current_score - best_score:+.6f})"
@@ -1693,18 +1829,24 @@ def _main_training_loop(
             f"val_loss={val_output['loss']:.4f} | "
             f"val_auc={metrics['auc']:.4f} | "
             f"val_acc={metrics['acc']:.4f} | "
-            f"val_f1={metrics['f1']:.4f} "
+            f"val_f1={metrics['f1']:.4f} | "
+            f"lr={current_lr:.2e} "
             f"delta={delta_str}"
         )
 
-        # 构建 checkpoint 数据
+        # 构建 checkpoint 数据。
+        # 注意：将 args 中所有 pathlib.Path 字段预转为 str，确保 checkpoint 不含
+        # 非原生 Python 类型。PyTorch 2.6 默认以 weights_only=True 加载，而
+        # Path 对象不在安全全局列表中，直接保存会导致后续 torch.load 失败。
+        # 使用已有的 make_json_safe 工具函数统一处理，零冗余。
+        safe_args = make_json_safe(vars(args))
         checkpoint_data = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "best_score": best_score,
             "current_score": current_score,
-            "args": vars(args),
+            "args": safe_args,
             "run_id": run_id,
         }
 
@@ -1740,7 +1882,10 @@ def _main_training_loop(
         raise RuntimeError("Training finished without a valid best checkpoint.")
 
     # 使用验证集上最佳的权重重新加载模型，再做最终导出。
-    checkpoint = torch.load(best_checkpoint_path, map_location=device)
+    # weights_only=True：PyTorch 2.6 的安全默认值，仅反序列化 tensor/storage 类型；
+    # checkpoint 中的 args 已在保存时通过 make_json_safe 将 Path 转为 str，
+    # 因此这里直接使用 weights_only=True 即可安全加载。
+    checkpoint = torch.load(best_checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     eval_outputs: Dict[str, Dict[str, object]] = {}
