@@ -8,20 +8,39 @@ ResNet-18 模型定义文件。
 2. 支持 ImageNet 预训练权重初始化；
 3. 支持自定义输入通道数，适配多模态 2.5D MRI 输入；
 4. 支持自定义输出类别数，便于后续 baseline 与其他实验复用；
-5. 支持在分类头前插入 Dropout，用于正则化、缓解过拟合。
+5. 支持在分类头前插入 Dropout，用于正则化、缓解过拟合；
+6. 支持分层参数组（Layerwise Parameter Groups），便于对骨干网络与
+   分类头使用差异化学习率，防止预训练特征被过大的学习率破坏。
 
 推荐用法：
 
 ```python
-from models.resnet_18 import ResNet18
+from models.resnet_18 import ResNet18Classifier
 
-model = ResNet18(
+# 构建模型
+model = ResNet18Classifier(
     in_channels=35,      # 例如 6 模态 * 5 切片 + 5 VOI 通道 = 35
     num_classes=2,
     pretrained=True,
     dropout_p=0.5,       # 分类头前 Dropout 概率，0.0 表示不使用
 )
+
+# 获取分层参数组，对骨干网络使用较小的学习率
+param_groups = model.get_param_groups(base_lr=1e-4, lr_mult=0.1)
+optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-2)
 ```
+
+分层学习率策略说明：
+  ResNet-18 骨干网络按深度分为 4 个阶段（layer1~layer4），加上 conv1/bn1
+  组成的浅层特征提取器，以及最后的全连接分类头（fc）。迁移学习时推荐：
+
+  - 浅层（conv1 + layer1）：学习率最小，保留 ImageNet 通用特征；
+  - 中层（layer2 + layer3）：学习率适中；
+  - 深层（layer4）：学习率较大，适应领域特征；
+  - 分类头（fc）：学习率最大，随机初始化需快速收敛。
+
+  通过 `get_param_groups(base_lr, lr_mult)` 自动按上述策略分配学习率，
+  其中 `base_lr` 为分类头学习率，`lr_mult`（默认 0.1）为骨干相对倍率。
 """
 
 from __future__ import annotations
@@ -154,6 +173,7 @@ class ResNet18Classifier(nn.Module):
     """一个轻量封装，便于训练脚本直接实例化并通过 CLI 参数配置模型。
 
     封装了 ResNet18() 工厂函数的所有参数，统一对外暴露。
+    额外提供 get_param_groups() 方法，支持分层差异化学习率。
     """
 
     def __init__(
@@ -183,6 +203,92 @@ class ResNet18Classifier(nn.Module):
 
         return self.model(x)
 
+    def get_param_groups(
+        self,
+        base_lr: float,
+        lr_mult: float = 0.1,
+    ) -> list[dict]:
+        """将模型参数按层次分组，返回可直接传入优化器的参数组列表。
+
+        ResNet-18 骨干按深度分为 5 组（浅→深），分类头单独一组，共 6 组。
+        骨干各组的学习率 = base_lr × lr_mult × 层级系数，保证浅层改动最小。
+
+        分组与学习率分配：
+
+          组别            层                学习率
+          ──────────────────────────────────────────────────
+          group_stem     conv1 + bn1       base_lr × lr_mult × 0.2
+          group_layer1   layer1            base_lr × lr_mult × 0.4
+          group_layer2   layer2            base_lr × lr_mult × 0.6
+          group_layer3   layer3            base_lr × lr_mult × 0.8
+          group_layer4   layer4            base_lr × lr_mult × 1.0
+          group_head     fc                base_lr
+          ──────────────────────────────────────────────────
+
+        参数：
+        - base_lr:
+          分类头（fc 层）的学习率，通常取优化器全局 lr（如 args.lr）。
+        - lr_mult:
+          骨干网络相对于分类头的学习率倍率（默认 0.1）。
+          例如 base_lr=1e-4、lr_mult=0.1，则骨干最深层学习率为 1e-5。
+
+        返回：
+        - 包含 6 个字典的列表，每个字典形如
+          {"params": [...], "lr": float, "name": str}，
+          可直接传入 torch.optim.AdamW / SGD 等优化器。
+
+        使用示例：
+        ```python
+        param_groups = model.get_param_groups(base_lr=args.lr, lr_mult=0.1)
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            weight_decay=args.weight_decay,
+        )
+        ```
+
+        注意：
+        - 仅包含 requires_grad=True 的参数，冻结层会被自动跳过；
+        - 若某组内所有参数均被冻结，该组仍会出现在列表中（params 为空列表），
+          优化器对空组无任何影响，不影响训练；
+        - 建议配合 CosineAnnealingLR 或 ReduceLROnPlateau 调度器使用，
+          调度器会按比例同步调整各组学习率。
+        """
+        m = self.model  # 内部 torchvision ResNet-18 实例
+
+        # 定义各骨干段及其相对学习率系数（越浅系数越小）
+        backbone_groups = [
+            ("stem",   [m.conv1, m.bn1], 0.2),
+            ("layer1", [m.layer1],       0.4),
+            ("layer2", [m.layer2],       0.6),
+            ("layer3", [m.layer3],       0.8),
+            ("layer4", [m.layer4],       1.0),
+        ]
+
+        param_groups: list[dict] = []
+
+        for group_name, modules, scale in backbone_groups:
+            params = [
+                p
+                for mod in modules
+                for p in mod.parameters()
+                if p.requires_grad
+            ]
+            param_groups.append({
+                "params": params,
+                "lr":     base_lr * lr_mult * scale,
+                "name":   f"backbone_{group_name}",
+            })
+
+        # 分类头：使用完整的 base_lr
+        head_params = [p for p in m.fc.parameters() if p.requires_grad]
+        param_groups.append({
+            "params": head_params,
+            "lr":     base_lr,
+            "name":   "head_fc",
+        })
+
+        return param_groups
+
 
 if __name__ == "__main__":
     # 简单自检：验证模型可以被正常构建并处理一个假输入。
@@ -195,3 +301,19 @@ if __name__ == "__main__":
         print(f"  Input shape : {tuple(dummy_input.shape)}")
         print(f"  Output shape: {tuple(dummy_output.shape)}")
         print(f"  fc layer    : {dummy_model.fc}")
+
+    # 测试 ResNet18Classifier.get_param_groups()
+    print("\n--- get_param_groups() 测试 ---")
+    clf = ResNet18Classifier(in_channels=35, num_classes=2, pretrained=False, dropout_p=0.0)
+    base_lr = 1e-4
+    groups = clf.get_param_groups(base_lr=base_lr, lr_mult=0.1)
+    total_params = 0
+    for g in groups:
+        n_params = sum(p.numel() for p in g["params"])
+        total_params += n_params
+        print(f"  [{g['name']:20s}]  lr={g['lr']:.2e}  params={n_params:,}")
+    model_params = sum(p.numel() for p in clf.parameters() if p.requires_grad)
+    assert total_params == model_params, (
+        f"参数数量不一致：分组合计 {total_params:,} ≠ 模型总参数 {model_params:,}"
+    )
+    print(f"  参数总量一致性检查通过（共 {total_params:,} 个可训练参数）")

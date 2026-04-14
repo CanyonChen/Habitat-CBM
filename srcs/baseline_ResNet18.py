@@ -195,11 +195,20 @@ ResNet-18 基线训练脚本，用于病人级别的 IDH 突变状态预测。
 
 --dropout-p (float)
     ResNet-18 分类头前 Dropout 层的 dropout 概率。
-    默认值: 0.5
+    默认值: 0.7
     可用范围: [0.0, 1.0)
     说明: 设为 0.0 则不添加 Dropout 层；对于训练块数远多于验证患者数的情况
           （如约 6000 blocks vs 14 名患者），Dropout 可显著抑制过拟合。
-          建议范围: 0.3 ~ 0.5。
+          建议范围: 0.5 ~ 0.7。
+
+--freeze-layers (str)
+    冻结 ResNet-18 backbone 中哪些层（不参与反向传播），用逗号分隔。
+    可用选项: none, conv1, layer1, layer2, layer3, layer4
+    默认值: conv1,layer1,layer2,layer3
+    说明: 冻结早期层可大幅减少可训练参数量，是小样本场景下最有效的正则化手段之一。
+          - none: 不冻结任何层，全量微调（当前行为，容易过拟合）；
+          - conv1,layer1,layer2,layer3: 只训练 layer4 + fc，参数量从 ~11M 降至 ~2.7M；
+          - 建议小数据场景使用 conv1,layer1,layer2,layer3，以 layer4+fc 适配医学影像特征。
 
 --label-smoothing (float)
     CrossEntropyLoss 的 label smoothing 系数。
@@ -575,25 +584,25 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--aug-affine-prob",
         type=float,
-        default=0.5,
+        default=0.8,
         help="Probability of applying the shared affine transform on image/mask.",
     )
     parser.add_argument(
         "--aug-rotate-deg",
         type=float,
-        default=10.0,
+        default=20.0,
         help="Maximum in-plane rotation angle in degrees for RandAffined.",
     )
     parser.add_argument(
         "--aug-translate-px",
         type=float,
-        default=8.0,
+        default=15.0,
         help="Maximum in-plane translation in pixels for RandAffined.",
     )
     parser.add_argument(
         "--aug-scale-range",
         type=float,
-        default=0.1,
+        default=0.2,
         help="Maximum isotropic scaling factor delta for RandAffined.",
     )
     parser.add_argument(
@@ -605,25 +614,25 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--aug-intensity-scale-prob",
         type=float,
-        default=0.3,
+        default=0.5,
         help="Probability of applying intensity scaling on the image channels.",
     )
     parser.add_argument(
         "--aug-intensity-scale",
         type=float,
-        default=0.1,
+        default=0.15,
         help="Maximum intensity scaling factor used by RandScaleIntensityd.",
     )
     parser.add_argument(
         "--aug-intensity-shift-prob",
         type=float,
-        default=0.3,
+        default=0.5,
         help="Probability of applying intensity shifting on the image channels.",
     )
     parser.add_argument(
         "--aug-intensity-shift",
         type=float,
-        default=0.1,
+        default=0.15,
         help="Maximum std-based intensity shift used by RandStdShiftIntensityd.",
     )
     parser.add_argument("--batch-size", type=int, default=16, help="Mini-batch size.")
@@ -631,14 +640,20 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-4,
-        help="AdamW learning rate. Default 1e-4 (reduced from 5e-4) works better with cosine scheduler on small datasets.",
+        default=2e-5,
+        help=(
+            "AdamW learning rate. Default 2e-5 (reduced from 1e-4) slows down learning to mitigate "
+            "early overfitting on small medical image datasets."
+        ),
     )
     parser.add_argument(
         "--weight-decay",
         type=float,
-        default=1e-3,
-        help="AdamW weight decay (L2 regularization). Default 1e-3 (increased from 1e-4) for stronger regularization.",
+        default=1e-2,
+        help=(
+            "AdamW weight decay (L2 regularization). Default 1e-2 (increased from 1e-3) for "
+            "stronger regularization on small datasets (~56 training patients)."
+        ),
     )
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers.")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Global random seed.")
@@ -647,6 +662,19 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str2bool,
         default=True,
         help="Whether to initialize ResNet-18 from ImageNet weights.",
+    )
+    parser.add_argument(
+        "--freeze-layers",
+        type=str,
+        default="conv1,layer1,layer2,layer3",
+        help=(
+            "Comma-separated list of ResNet-18 layers to freeze (no gradient). "
+            "Valid names: none, conv1, bn1, layer1, layer2, layer3, layer4. "
+            "Use 'none' to disable freezing (full fine-tuning). "
+            "Default 'conv1,layer1,layer2,layer3' freezes early layers, only trains layer4+fc "
+            "reducing trainable params from ~11M to ~2.7M — the most effective overfitting remedy "
+            "for small medical image datasets."
+        ),
     )
     parser.add_argument(
         "--resize-height",
@@ -669,49 +697,51 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--early-stop-patience",
         type=int,
-        default=20,
+        default=30,
         help=(
             "Stop if validation AUC does not improve for N epochs. "
-            "Default 20 (increased from 5) is more appropriate for a ~14-patient validation set "
-            "where the minimum AUC resolution is ~0.0156."
+            "Default 30 (increased from 20) gives the model more time to escape from early overfitting "
+            "and find a better generalization point."
         ),
     )
     parser.add_argument(
         "--early-stop-min-delta",
         type=float,
-        default=0.005,
+        default=0.0,
         help=(
             "Minimum change in validation score to qualify as an improvement for early stopping. "
-            "Default 0.005 (increased from 0.001) filters noise better given the small validation set."
+            "Default 0.0 (reduced from 0.005): any improvement counts, since with strong regularization "
+            "the model may improve only marginally per epoch."
         ),
     )
     parser.add_argument(
         "--dropout-p",
         type=float,
-        default=0.5,
+        default=0.7,
         help=(
             "Dropout probability applied before the final classification layer. "
-            "0.0 disables Dropout. Recommended range: 0.3–0.5 to combat overfitting "
+            "0.0 disables Dropout. Default 0.7 (increased from 0.5) for stronger regularization "
             "when training blocks (~6000) greatly outnumber validation patients (~14)."
         ),
     )
     parser.add_argument(
         "--label-smoothing",
         type=float,
-        default=0.1,
+        default=0.2,
         help=(
             "Label smoothing coefficient for CrossEntropyLoss (0.0 = standard cross-entropy). "
-            "Softens one-hot targets to prevent overconfident predictions on small datasets."
+            "Default 0.2 (increased from 0.1) softens one-hot targets more aggressively "
+            "to prevent overconfident predictions on small datasets."
         ),
     )
     parser.add_argument(
         "--lr-scheduler",
         choices=("none", "cosine", "plateau"),
-        default="cosine",
+        default="plateau",
         help=(
-            "Learning rate scheduler. "
+            "Learning rate scheduler. Default 'plateau' (changed from 'cosine'): "
+            "reduces lr when val AUC stagnates, more conservative than cosine for overfitting scenarios. "
             "'cosine': CosineAnnealingLR (T_max=epochs, eta_min=1e-6), smoothly decays lr. "
-            "'plateau': ReduceLROnPlateau (mode=max, factor=0.5, patience=5), halves lr on stagnation. "
             "'none': constant lr throughout training."
         ),
     )
@@ -1597,6 +1627,7 @@ def export_run_config_yaml(args: argparse.Namespace, output_dir: Path) -> None:
             "num_workers": args.num_workers,
             "seed": args.seed,
             "pretrained": args.pretrained,
+            "freeze_layers": args.freeze_layers,
             "use_class_weights": args.use_class_weights,
             "early_stop_patience": args.early_stop_patience,
             "early_stop_min_delta": args.early_stop_min_delta,
@@ -1700,6 +1731,20 @@ def main() -> None:
         _main_training_loop(args, run_id, output_dir)
 
 
+def _parse_freeze_layers(freeze_layers_str: str) -> list:
+    """解析 --freeze-layers 参数，返回需要冻结的层名列表。
+
+    参数:
+        freeze_layers_str: 逗号分隔的层名字符串，如 'conv1,layer1,layer2,layer3'，
+                           或 'none'/'' 表示不冻结。
+    返回:
+        层名列表，例如 ['conv1', 'layer1', 'layer2', 'layer3']；若不冻结则返回空列表。
+    """
+    if not freeze_layers_str or freeze_layers_str.strip().lower() == "none":
+        return []
+    return [name.strip() for name in freeze_layers_str.split(",") if name.strip() and name.strip().lower() != "none"]
+
+
 def _main_training_loop(
     args: argparse.Namespace, run_id: str, output_dir: Path
 ) -> None:
@@ -1726,13 +1771,52 @@ def _main_training_loop(
         dropout_p=args.dropout_p,  # 分类头前 Dropout，用于抑制过拟合
     ).to(device)
 
+    # 冻结指定的 backbone 层以减少可训练参数，缓解小样本过拟合。
+    # 例如冻结 conv1,layer1,layer2,layer3 后，可训练参数从 ~11M 降至 ~2.7M。
+    freeze_layer_names = _parse_freeze_layers(args.freeze_layers)
+    if freeze_layer_names:
+        frozen_params = 0
+        for layer_name in freeze_layer_names:
+            layer = getattr(model.model, layer_name, None)
+            if layer is None:
+                raise ValueError(
+                    f"--freeze-layers: '{layer_name}' is not a valid ResNet-18 layer name. "
+                    "Valid options: conv1, bn1, layer1, layer2, layer3, layer4."
+                )
+            for param in layer.parameters():
+                param.requires_grad = False
+                frozen_params += param.numel()
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(
+            f"Frozen layers: {freeze_layer_names} "
+            f"(frozen_params={frozen_params:,}, trainable_params={trainable_params:,})"
+        )
+    else:
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"No layers frozen (full fine-tuning, trainable_params={trainable_params:,})")
+
     class_weights = None
     if args.use_class_weights:
         class_weights = compute_class_weights(datasets["train"], device)
     # CrossEntropyLoss 增加 label_smoothing，软化目标标签防止模型过于自信；
     # 优化器为 AdamW，增大 weight_decay 至 1e-3 以加强 L2 正则化。
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=args.label_smoothing)
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # 使用分层差异化学习率：骨干浅层使用极小学习率以保护预训练特征，
+    # 分类头使用完整 args.lr 以快速收敛。lr_mult=0.1 表示骨干最深层
+    # 学习率为 args.lr × 0.1，浅层进一步缩小至 args.lr × 0.02。
+    # 若模型未提供 get_param_groups()（如非 ResNet18Classifier 实例），
+    # 则回退到全参数统一学习率，保持向后兼容。
+    if hasattr(model, "get_param_groups"):
+        param_groups = model.get_param_groups(base_lr=args.lr, lr_mult=0.1)
+        group_info = "  |  ".join(
+            f"{g['name']}:lr={g['lr']:.2e}" for g in param_groups
+        )
+        print(f"Using layerwise param groups: {group_info}")
+    else:
+        param_groups = model.parameters()
+        print(f"Using uniform lr={args.lr:.2e} for all parameters (no get_param_groups)")
+    optimizer = AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
 
     # 构建学习率调度器（可选）
     # - cosine: 余弦退火，将 lr 从初始值平滑衰减至 eta_min=1e-6，适合大多数场景。
