@@ -167,7 +167,7 @@ except Exception:  # pragma: no cover - 运行环境可能没有 sklearn
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]  # habitat_CBM/
-DEFAULT_DATASET_ROOT = PROJECT_ROOT / "dataset"
+DEFAULT_DATASET_ROOT = PROJECT_ROOT / "dataset" / "images"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "dataset" / "habitat_masks"
 
 BRANCHES = ("conventional", "functional")
