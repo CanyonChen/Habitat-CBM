@@ -8,6 +8,7 @@
 # 核心依赖 (必须)
 numpy>=1.24,<2.0          # 注意: 必须使用 1.x 版本，2.x 可能不兼容
 SimpleITK>=2.3,<3.0       # 医学图像 I/O
+nibabel>=5.1,<6.0         # NIfTI 读写（build_habitat.py 需要）
 pyradiomics>=3.0,<4.0     # 影像组学特征提取
 
 # 数据科学与机器学习
@@ -21,6 +22,12 @@ matplotlib>=3.7           # ROC 曲线、混淆矩阵等图表绘制
 # 其他工具库
 PyYAML>=6.0               # YAML 配置文件读写
 tqdm>=4.65                # 进度条显示
+
+# Habitat 掩膜构建的 GPU 加速（可选）
+# 若希望 build_habitat.py 使用 --device cuda，请根据服务器 CUDA 版本
+# 安装官方匹配的 PyTorch wheel；不要盲目在这里固定一个通用 torch 包。
+# 例如参考: https://pytorch.org/get-started/locally/
+# torch>=2.2,<3.0
 
 # 构建依赖 (安装时需要)
 versioneer>=0.29

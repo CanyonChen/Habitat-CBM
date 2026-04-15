@@ -11,12 +11,13 @@
 2. [脚本概览](#脚本概览)
 3. [data_split.py - 数据划分](#data_splitpy---数据划分)
 4. [data_loader.py - 数据加载](#data_loaderpy---数据加载)
-5. [monai_augmentation.py - 数据增强](#monai_augmentationpy---数据增强)
-6. [baseline_ResNet18.py - 基线训练](#baseline_resnet18py---基线训练)
-7. [baseline_RadiomicsLR.py - 传统影像组学基线](#baseline_radiomicslrpy---传统影像组学基线)
-8. [典型工作流程](#典型工作流程)
-9. [数据流说明](#数据流说明)
-10. [常见问题排查](#常见问题排查)
+5. [build_habitat.py - 多模态 Habitat 掩膜构建](#build_habitatpy---多模态-habitat-掩膜构建)
+6. [monai_augmentation.py - 数据增强](#monai_augmentationpy---数据增强)
+7. [baseline_ResNet18.py - 基线训练](#baseline_resnet18py---基线训练)
+8. [baseline_RadiomicsLR.py - 传统影像组学基线](#baseline_radiomicslrpy---传统影像组学基线)
+9. [典型工作流程](#典型工作流程)
+10. [数据流说明](#数据流说明)
+11. [常见问题排查](#常见问题排查)
 
 ---
 
@@ -44,7 +45,7 @@ pip install -r habitat_CBM/repo/requirements_pyradiomics.txt
 - joblib
 ```
 
-### 三步完成训练
+### 五步完成 habitat 构建与基线训练
 
 ```bash
 # 1. 数据划分
@@ -58,14 +59,20 @@ python habitat_CBM/repo/srcs/data_loader.py \
     --split-root /path/to/splited_data/train \
     --block-depth 5
 
-# 3. 训练 ResNet-18 基线模型
+# 3. 构建 habitat masks（H1 / H2 / H3 / H1+2）
+python habitat_CBM/repo/srcs/build_habitat.py \
+    --dataset-root /path/to/images \
+    --output-root habitat_CBM/dataset/habitat_masks \
+    --device auto
+
+# 4. 训练 ResNet-18 基线模型
 python habitat_CBM/repo/srcs/baseline_ResNet18.py \
     --split-base-root /path/to/splited_data \
     --output-root /path/to/results \
     --epochs 200 \
     --batch-size 32
 
-# 4. 训练传统影像组学 + LASSO LR 基线模型
+# 5. 训练传统影像组学 + LASSO LR 基线模型
 python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
     --split-base-root /path/to/splited_data \
     --output-root /path/to/results/baseline_RadiomicsLR \
@@ -81,6 +88,7 @@ python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
 |------|------|----------|------|------|
 | `data_split.py` | 患者级分层划分 | 将原始数据划分为训练/验证/测试集 | `images/` 目录 + `idh.csv` | `splited_data/` 目录 |
 | `data_loader.py` | 2.5D 数据加载 | 读取多模态 MRI 并生成 2.5D blocks | `splited_data/` 目录 | PyTorch Dataset |
+| `build_habitat.py` | Habitat 掩膜构建 | 用 `ADC + CBF + functional/voi` 生成 `H1/H2/H3/H1+2` | 预处理后的 `dataset/` | `dataset/habitat_masks/` + manifests |
 | `monai_augmentation.py` | 数据增强 | 提供训练时的数据增强变换 | Dataset samples | Augmented samples |
 | `baseline_ResNet18.py` | 基线训练 | 训练 ResNet-18 进行 IDH 分类 | 划分后的数据 | 模型、预测、指标 |
 | `baseline_RadiomicsLR.py` | 传统影像组学基线 | 提取 PyRadiomics 特征并训练 LASSO Logistic Regression | 划分后的 `conventional/` 数据 | 特征表、模型、预测、指标 |
@@ -327,6 +335,171 @@ print(dataset.summary())
 | voi | `voi` |
 
 > 注意：T1 和 T1CE、T2 和 T2FLAIR 有排除规则，避免误匹配。
+
+---
+
+## build_habitat.py - 多模态 Habitat 掩膜构建
+
+### 功能描述
+
+`build_habitat.py` 用于把已经完成预处理的 `ADC / CBF / functional/voi` 转成论文同款的 habitat 掩膜。
+
+脚本按**每位患者独立聚类**的方式完成：
+
+1. 在 `functional/voi` 内提取 `ADC` 与 `CBF` 配对体素；
+2. 分别做患者内 z-score 标准化；
+3. 在二维空间执行 `K-means(k=3)`；
+4. 将原始 cluster 映射为带生理语义的 `H1 / H2 / H3`；
+5. 只持久化保存四个 mask：
+   - `H1`
+   - `H2`
+   - `H3`
+   - `H1+2`
+
+其中 `H1+2` 是论文最终进入主线 radiomics 分析的最优 habitat。
+
+> 注意：当前 `baseline_RadiomicsLR.py` 仍然默认读取 `conventional/voi` 做 whole-tumor radiomics。
+> `build_habitat.py` 产物主要用于后续 habitat radiomics / Habitat-CBM 前置准备，不会自动被现有 baseline 脚本读取。
+
+### 输入要求
+
+脚本直接读取预处理后的 `dataset_root`，要求目录中至少存在：
+
+```text
+dataset_root/
+├── conventional/
+│   ├── mutant/<patient_id>/
+│   └── wild_type/<patient_id>/
+└── functional/
+    ├── mutant/<patient_id>/
+    │   ├── adc.nii.gz
+    │   ├── cbf.nii.gz
+    │   └── voi.nii.gz
+    └── wild_type/<patient_id>/
+```
+
+强约束如下：
+
+- habitat 聚类固定使用 `functional/<label>/<patient_id>/adc`
+- habitat 聚类固定使用 `functional/<label>/<patient_id>/cbf`
+- canonical VOI 固定使用 `functional/<label>/<patient_id>/voi`
+- 三者必须 shape 一致，且 affine 一致
+
+### 输出目录结构
+
+默认输出目录为 `habitat_CBM/dataset/habitat_masks/`：
+
+```text
+habitat_CBM/dataset/habitat_masks/
+├── mutant/
+│   └── 005/
+│       ├── h1.nii.gz
+│       ├── h2.nii.gz
+│       ├── h3.nii.gz
+│       └── h12.nii.gz
+├── wild_type/
+│   └── 003/
+│       ├── h1.nii.gz
+│       ├── h2.nii.gz
+│       ├── h3.nii.gz
+│       └── h12.nii.gz
+└── manifests/
+    ├── habitat_centers.csv
+    ├── habitat_volume_summary.csv
+    ├── habitat_qc.csv
+    ├── run_summary.json
+    └── failed_cases.csv          # 仅在 --skip-errors true 且存在失败病例时生成
+```
+
+### GPU 加速说明
+
+脚本优先使用 GPU，但加速重点在**体素级聚类**而不是整个 NIfTI I/O：
+
+- CPU 负责：
+  - 扫描目录
+  - 读取/写出 NIfTI
+  - 组织病例与 manifests
+- GPU 负责（若 `torch + CUDA` 可用）：
+  - VOI 内 `ADC/CBF` 张量标准化
+  - K-means 距离计算、分配与中心更新
+
+对你的服务器配置：
+
+- `25 vCPU`
+- `120 GB RAM`
+- `Nvidia RTX Pro 6000 Blackwell 96 GB`
+
+推荐优先用：
+
+```bash
+python habitat_CBM/repo/srcs/build_habitat.py \
+    --dataset-root /path/to/images \
+    --output-root habitat_CBM/dataset/habitat_masks \
+    --device cuda:0 \
+    --chunk-size 524288
+```
+
+如果单病例 VOI 很大、显存仍然充裕，可以进一步尝试把 `--chunk-size` 提到 `1048576`；默认值 `262144` 更稳健。
+
+### 核心参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--dataset-root` | `Path` | `habitat_CBM/dataset` | 预处理后数据根目录 |
+| `--output-root` | `Path` | `habitat_CBM/dataset/habitat_masks` | 四个 habitat mask 的输出根目录 |
+| `--device` | `str` | `auto` | `auto/cpu/cuda/cuda:0` 等 |
+| `--seed` | `int` | `42` | 随机种子 |
+| `--n-clusters` | `int` | `3` | 论文固定为 3，不建议修改 |
+| `--n-init` | `int` | `20` | K-means 初始化次数 |
+| `--max-iter` | `int` | `100` | 最大迭代轮数 |
+| `--tol` | `float` | `1e-4` | 收敛阈值 |
+| `--chunk-size` | `int` | `262144` | torch/GPU 聚类分块大小 |
+| `--eps` | `float` | `1e-8` | 数值稳定项 |
+| `--overwrite-existing` | `bool` | `true` | 已存在患者输出目录时是否覆盖 |
+| `--patient-ids` | `list[str]` | `None` | 仅处理指定患者，逗号分隔 |
+| `--max-patients` | `int` | `0` | 仅处理前 N 位患者，调试用 |
+| `--skip-errors` | `bool` | `false` | 单病例失败时是否跳过并继续 |
+| `--save-run-config` | `bool` | `true` | 是否写入 `run_summary.json` |
+
+### 运行示例
+
+```bash
+# 1. 默认自动选择设备（有 CUDA 就走 GPU）
+python habitat_CBM/repo/srcs/build_habitat.py \
+    --dataset-root /path/to/images \
+    --output-root habitat_CBM/dataset/habitat_masks \
+    --device auto
+
+# 2. 指定 GPU，并放大 chunk 提高吞吐
+python habitat_CBM/repo/srcs/build_habitat.py \
+    --dataset-root /path/to/images \
+    --device cuda:0 \
+    --chunk-size 524288
+
+# 3. 只调试 5 位患者
+python habitat_CBM/repo/srcs/build_habitat.py \
+    --dataset-root /path/to/images \
+    --max-patients 5 \
+    --device cpu
+
+# 4. 仅处理指定病例，并在遇错时继续
+python habitat_CBM/repo/srcs/build_habitat.py \
+    --dataset-root /path/to/images \
+    --patient-ids 003,005,013 \
+    --skip-errors true
+```
+
+### 质控建议
+
+建议每次运行后至少检查三类 manifest：
+
+- `habitat_centers.csv`
+  - 看 H1 是否表现为低 ADC / 高 CBF
+  - 看 H3 是否表现为高 ADC / 低 CBF
+- `habitat_volume_summary.csv`
+  - 看 `h1 + h2` 是否与 `h12` 体素数一致
+- `habitat_qc.csv`
+  - 看每位患者是否通过语义顺序检查和体积一致性检查
 
 ---
 
@@ -795,7 +968,14 @@ for split in train val test; do
         --max-samples 2
 done
 
-# Step 3A: 训练 ResNet-18 深度学习基线
+# Step 3: 生成 habitat masks（为 habitat radiomics / Habitat-CBM 做准备）
+python habitat_CBM/repo/srcs/build_habitat.py \
+    --dataset-root /path/to/images \
+    --output-root habitat_CBM/dataset/habitat_masks \
+    --device cuda:0 \
+    --chunk-size 524288
+
+# Step 4A: 训练 ResNet-18 深度学习基线
 python habitat_CBM/repo/srcs/baseline_ResNet18.py \
     --split-base-root habitat_CBM/data/splited_data \
     --output-root habitat_CBM/results/baseline_ResNet18 \
@@ -810,7 +990,7 @@ python habitat_CBM/repo/srcs/baseline_ResNet18.py \
     --seed 42 \
     --run-id baseline_seed42
 
-# Step 3B: 训练传统影像组学 + LASSO LR 基线
+# Step 4B: 训练传统影像组学 + LASSO LR 基线
 python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
     --split-base-root habitat_CBM/data/splited_data \
     --output-root habitat_CBM/results/baseline_RadiomicsLR \
@@ -820,7 +1000,7 @@ python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
     --seed 42 \
     --run-id baseline_radiomics_lr_seed42
 
-# Step 4: 查看结果
+# Step 5: 查看结果
 cat habitat_CBM/results/baseline_ResNet18/baseline_seed42/metrics_summary_resnet18_baseline_seed42.csv
 cat habitat_CBM/results/baseline_RadiomicsLR/baseline_radiomics_lr_seed42/metrics_radiomics_lr.csv
 ```
@@ -868,8 +1048,18 @@ cat habitat_CBM/results/cv_runs/metrics_resnet18_summary.csv
 │      ├── mutant/001/, 002/, ...                                  │
 │      └── wild_type/003/, 004/, ...                               │
 └─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼ data_split.py
+                 ┌────────────┴────────────┐
+                 │                         │
+                 ▼ build_habitat.py        ▼ data_split.py
+┌─────────────────────────────────────────────────────────────────┐
+│                    Habitat 掩膜输出                              │
+│  habitat_masks/                                                  │
+│  ├── mutant/<patient_id>/h1.nii.gz, h2.nii.gz, h3.nii.gz, h12.nii.gz │
+│  ├── wild_type/<patient_id>/...                                 │
+│  └── manifests/                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                                           │
+                                           ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                      划分后的数据                                │
 │  splited_data/                                                   │
@@ -983,7 +1173,38 @@ cat habitat_CBM/results/cv_runs/metrics_resnet18_summary.csv
 检查数据加载是否正确
 ```
 
-### 4. 结果问题
+### 4. Habitat 构建问题
+
+**Q: build_habitat.py 提示 Missing runtime dependencies**
+```
+先安装:
+pip install -r habitat_CBM/repo/requirements_pyradiomics.txt
+
+若希望走 GPU，还需要按服务器 CUDA 版本安装匹配的 PyTorch 官方 wheel
+```
+
+**Q: build_habitat.py 没有用上 GPU**
+```
+先确认 python -c "import torch; print(torch.cuda.is_available())" 返回 True
+再显式指定 --device cuda:0
+若仍走 CPU，通常是当前环境安装的是 CPU-only PyTorch
+```
+
+**Q: habitat_qc.csv 里语义顺序检查失败**
+```
+先核对 ADC / CBF / VOI 是否真的在同一空间
+再检查 VOI 是否过小、是否包含大量坏值
+少量病例存在边界情况时，可先人工复核 overlay 和 cluster centers
+```
+
+**Q: 单病例运行很慢**
+```
+优先使用 --device cuda:0
+在 96GB 显存环境下可尝试把 --chunk-size 提高到 524288 或 1048576
+若病例很多，可配合 --patient-ids 或 --max-patients 先做小批量调试
+```
+
+### 5. 结果问题
 
 **Q: 预测结果全为 0 或全为 1**
 ```
@@ -992,7 +1213,7 @@ cat habitat_CBM/results/cv_runs/metrics_resnet18_summary.csv
 尝试调整学习率
 ```
 
-### 5. Radiomics 问题
+### 6. Radiomics 问题
 
 **Q: PyRadiomics 报 mask / image geometry mismatch**
 ```
