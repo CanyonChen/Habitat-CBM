@@ -459,6 +459,7 @@ python habitat_CBM/repo/srcs/build_habitat.py \
 | `--patient-ids` | `list[str]` | `None` | 仅处理指定患者，逗号分隔 |
 | `--max-patients` | `int` | `0` | 仅处理前 N 位患者，调试用 |
 | `--skip-errors` | `bool` | `false` | 单病例失败时是否跳过并继续 |
+| `--allow-non-gzip-nii-gz` | `bool` | `true` | 当 `.nii.gz` 实际不是 gzip 时，回退按未压缩 NIfTI 读取 |
 | `--save-run-config` | `bool` | `true` | 是否写入 `run_summary.json` |
 
 ### 运行示例
@@ -486,6 +487,12 @@ python habitat_CBM/repo/srcs/build_habitat.py \
 python habitat_CBM/repo/srcs/build_habitat.py \
     --dataset-root /path/to/images \
     --patient-ids 003,005,013 \
+    --skip-errors true
+
+# 5. 严格检查数据（禁用 .nii.gz 非 gzip 容错）
+python habitat_CBM/repo/srcs/build_habitat.py \
+    --dataset-root /path/to/images \
+    --allow-non-gzip-nii-gz false \
     --skip-errors true
 ```
 
@@ -1188,6 +1195,30 @@ pip install -r habitat_CBM/repo/requirements_pyradiomics.txt
 先确认 python -c "import torch; print(torch.cuda.is_available())" 返回 True
 再显式指定 --device cuda:0
 若仍走 CPU，通常是当前环境安装的是 CPU-only PyTorch
+```
+
+**Q: ImageFileError: xxx.nii.gz is not a gzip file**
+```
+原因：
+文件后缀是 .nii.gz，但文件内容不是 gzip（常见于 .nii 被误命名为 .nii.gz）。
+
+当前脚本默认已开启容错：
+--allow-non-gzip-nii-gz true
+会自动回退为“按未压缩 NIfTI 读取”，并给出 RuntimeWarning。
+
+建议：
+1) 先让流程跑通（推荐）：
+   python habitat_CBM/repo/srcs/build_habitat.py --dataset-root /path/to/images
+2) 再做严格排查：
+   python habitat_CBM/repo/srcs/build_habitat.py \
+       --dataset-root /path/to/images \
+       --allow-non-gzip-nii-gz false \
+       --skip-errors true
+   然后查看 habitat_masks/manifests/failed_cases.csv 中的失败病例。
+
+长期修复（推荐在数据层面）：
+- 把误命名文件改成 .nii，或重新 gzip 压缩为真正的 .nii.gz。
+- 可用 gzip -t <file.nii.gz> 做快速校验（返回非 0 代表不是合法 gzip）。
 ```
 
 **Q: habitat_qc.csv 里语义顺序检查失败**

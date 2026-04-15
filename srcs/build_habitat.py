@@ -137,6 +137,7 @@ import random
 import shutil
 import sys
 import time
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -437,10 +438,46 @@ def build_patient_cases(dataset_root: Path) -> List[PatientCase]:
     return cases
 
 
-def load_nifti_image(path: Path) -> nib.spatialimages.SpatialImage:
+def _maybe_load_uncompressed_nifti_from_nii_gz(
+    path: Path,
+    original_error: Exception,
+) -> Optional[nib.spatialimages.SpatialImage]:
+    """尝试把“后缀为 .nii.gz 但实际未 gzip 压缩”的文件当作裸 NIfTI 读取。"""
+
+    lower_name = path.name.lower()
+    if not lower_name.endswith(".nii.gz"):
+        return None
+    if "not a gzip file" not in str(original_error).lower():
+        return None
+
+    # 某些数据在导出时会把 .nii 文件误命名为 .nii.gz。
+    # nib.load 会按 gzip 解码，从而抛出 "not a gzip file"。
+    # 这里回退到按裸 NIfTI 字节解析，保证流程可继续。
+    raw_bytes = path.read_bytes()
+    image = nib.Nifti1Image.from_bytes(raw_bytes)
+    warnings.warn(
+        f"Detected non-gzip payload with '.nii.gz' suffix, loaded as uncompressed NIfTI: {path}",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return image
+
+
+def load_nifti_image(
+    path: Path,
+    allow_non_gzip_nii_gz: bool = True,
+) -> nib.spatialimages.SpatialImage:
     """读取医学影像文件并返回 nibabel image 对象。"""
 
-    return nib.load(str(path))
+    try:
+        return nib.load(str(path))
+    except Exception as exc:
+        if not allow_non_gzip_nii_gz:
+            raise
+        recovered_image = _maybe_load_uncompressed_nifti_from_nii_gz(path, exc)
+        if recovered_image is not None:
+            return recovered_image
+        raise
 
 
 def load_nifti_array(path: Path) -> np.ndarray:
@@ -910,6 +947,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="遇到单病例错误时是否跳过并继续；默认 false。",
     )
     parser.add_argument(
+        "--allow-non-gzip-nii-gz",
+        type=str2bool,
+        default=True,
+        help=(
+            "当文件名为 .nii.gz 但内容不是 gzip 时，是否回退为未压缩 NIfTI 读取；"
+            "默认 true。建议同时在数据层面修复该文件。"
+        ),
+    )
+    parser.add_argument(
         "--save-run-config",
         type=str2bool,
         default=True,
@@ -965,6 +1011,7 @@ def main() -> None:
     print(f"n_clusters        : {args.n_clusters}")
     print(f"n_init            : {args.n_init}")
     print(f"max_iter          : {args.max_iter}")
+    print(f"allow_non_gzip    : {args.allow_non_gzip_nii_gz}")
     print(f"overwrite_existing: {args.overwrite_existing}")
     if torch is not None and torch_device is not None and torch_device.type == "cuda":
         gpu_name = torch.cuda.get_device_name(torch_device)
@@ -978,9 +1025,18 @@ def main() -> None:
 
     for case in tqdm(cases, desc="build-habitat", total=len(cases)):
         try:
-            adc_img = load_nifti_image(case.adc_path)
-            cbf_img = load_nifti_image(case.cbf_path)
-            voi_img = load_nifti_image(case.voi_path)
+            adc_img = load_nifti_image(
+                case.adc_path,
+                allow_non_gzip_nii_gz=args.allow_non_gzip_nii_gz,
+            )
+            cbf_img = load_nifti_image(
+                case.cbf_path,
+                allow_non_gzip_nii_gz=args.allow_non_gzip_nii_gz,
+            )
+            voi_img = load_nifti_image(
+                case.voi_path,
+                allow_non_gzip_nii_gz=args.allow_non_gzip_nii_gz,
+            )
 
             assert_same_geometry(adc_img, cbf_img, name=f"{case.patient_id}: adc vs cbf")
             assert_same_geometry(adc_img, voi_img, name=f"{case.patient_id}: adc vs voi")
