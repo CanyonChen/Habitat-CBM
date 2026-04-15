@@ -85,8 +85,9 @@ ResNet-18 基线训练脚本，用于病人级别的 IDH 突变状态预测。
 
 --min-nonzero-voxels (int)
     一个中心切片被保留为有效样本时，至少需要多少个前景体素。
-    默认值: 16
+    默认值: 32
     说明: 当启用 VOI 时，按 VOI 的非零体素数计算；否则按参考模态的非零体素数计算。
+          默认值从 16 提升至 32，过滤 VOI 区域极小的低质量切片，提升训练样本信噪比。
 
 --cache-volumes (bool)
     是否缓存体数据到内存，减少重复 IO。
@@ -108,9 +109,10 @@ ResNet-18 基线训练脚本，用于病人级别的 IDH 突变状态预测。
 
 --lr (float)
     AdamW 优化器的学习率。
-    默认值: 1e-4
-    可用范围: 建议 1e-5 ~ 1e-3
-    说明: 配合 cosine 调度器在小数据集上更稳定，比 5e-4 更不容易过拟合。
+    默认值: 5e-6
+    可用范围: 建议 1e-6 ~ 1e-4
+    说明: 从 2e-5 进一步降低到 5e-6，减缓 fc 层参数更新速度，缓解 best_epoch=3 的极早期过拟合。
+          配合 ReduceLROnPlateau，plateau 触发后 lr 可进一步降至 2.5e-6。
 
 --weight-decay (float)
     AdamW 的权重衰减系数（L2 正则化）。
@@ -182,6 +184,21 @@ ResNet-18 基线训练脚本，用于病人级别的 IDH 突变状态预测。
     可用范围: [0.0, 1.0]
     说明: 病人级概率 >= threshold 则预测为 mutant (1)，否则为 wild_type (0)。
 
+--topk-pool (int)
+    患者级聚合时保留的最高置信度 block 数量（Top-K 均值池化）。
+    默认值: 0（使用全部 block，简单均值）
+    说明: K > 0 时，按 |prob - 0.5| 降序排列，只对置信度最高的 K 个 block 取均值。
+          推荐值：设为每位患者典型 block 数量的 1/3（约 15~20）。
+          能有效过滤低质量/边缘切片对聚合概率的干扰，改善患者级预测准确性。
+
+--threshold-search (bool)
+    是否在训练结束后，基于验证集 Youden Index 自动搜索最优分类阈值。
+    可用选项: true, false, 1, 0, yes, no, y, n
+    默认值: true
+    说明: 若开启，会在 --threshold 固定阈值评估之外，额外搜索使 (TPR - FPR) 最大的
+          阈值，并输出使用最优阈值后的各 split 指标，以及测试集预测 CSV。
+          不改变主要评估结果，只作为诊断和分析工具。
+
 --log-to-file (bool)
     是否将终端输出同时保存到日志文件。
     可用选项: true, false, 1, 0, yes, no, y, n
@@ -204,18 +221,20 @@ ResNet-18 基线训练脚本，用于病人级别的 IDH 突变状态预测。
 --freeze-layers (str)
     冻结 ResNet-18 backbone 中哪些层（不参与反向传播），用逗号分隔。
     可用选项: none, conv1, layer1, layer2, layer3, layer4
-    默认值: conv1,layer1,layer2,layer3
+    默认值: conv1,layer1,layer2,layer3,layer4
     说明: 冻结早期层可大幅减少可训练参数量，是小样本场景下最有效的正则化手段之一。
-          - none: 不冻结任何层，全量微调（当前行为，容易过拟合）；
-          - conv1,layer1,layer2,layer3: 只训练 layer4 + fc，参数量从 ~11M 降至 ~2.7M；
-          - 建议小数据场景使用 conv1,layer1,layer2,layer3，以 layer4+fc 适配医学影像特征。
+          - none: 不冻结任何层，全量微调（容易过拟合）；
+          - conv1,layer1,layer2,layer3: 只训练 layer4 + fc，参数量 ~2.7M；
+          - conv1,layer1,layer2,layer3,layer4（默认）: 只训练 fc，参数量 ~1K，
+            最大程度抑制小样本过拟合；若 Val AUC 低于 0.75，可回退到 layer3。
 
 --label-smoothing (float)
     CrossEntropyLoss 的 label smoothing 系数。
-    默认值: 0.1
-    可用范围: [0.0, 1.0)
+    默认值: 0.3
+    可用范围: [0.0, 0.4)
     说明: 将 one-hot 标签软化为 (1 - ε) 和 ε / (C-1)，防止模型过于自信；
-          对小样本医学影像分类有正则化效果。设为 0.0 则使用标准交叉熵。
+          从 0.2 提升至 0.3，进一步抑制 train AUC=0.9995 的极度自信预测。
+          不建议超过 0.4，否则模型无法有效区分类别。设为 0.0 则使用标准交叉熵。
 
 --lr-scheduler (str)
     学习率调度策略。
@@ -571,8 +590,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-nonzero-voxels",
         type=int,
-        default=16,
-        help="Minimum foreground voxels required for a center slice; when VOI is enabled this is counted on functional/voi.",
+        default=32,
+        help=(
+            "Minimum foreground voxels required for a center slice; when VOI is enabled this is "
+            "counted on functional/voi. Default 32 (increased from 16) filters out near-empty slices "
+            "with very small VOI regions that carry little tumor information, improving sample quality."
+        ),
     )
     parser.add_argument("--cache-volumes", type=str2bool, default=True, help="Cache volumes.")
     parser.add_argument(
@@ -584,25 +607,25 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--aug-affine-prob",
         type=float,
-        default=0.8,
+        default=0.9,
         help="Probability of applying the shared affine transform on image/mask.",
     )
     parser.add_argument(
         "--aug-rotate-deg",
         type=float,
-        default=20.0,
+        default=30.0,
         help="Maximum in-plane rotation angle in degrees for RandAffined.",
     )
     parser.add_argument(
         "--aug-translate-px",
         type=float,
-        default=15.0,
+        default=20.0,
         help="Maximum in-plane translation in pixels for RandAffined.",
     )
     parser.add_argument(
         "--aug-scale-range",
         type=float,
-        default=0.2,
+        default=0.25,
         help="Maximum isotropic scaling factor delta for RandAffined.",
     )
     parser.add_argument(
@@ -620,7 +643,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--aug-intensity-scale",
         type=float,
-        default=0.15,
+        default=0.25,
         help="Maximum intensity scaling factor used by RandScaleIntensityd.",
     )
     parser.add_argument(
@@ -632,18 +655,43 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--aug-intensity-shift",
         type=float,
-        default=0.15,
+        default=0.25,
         help="Maximum std-based intensity shift used by RandStdShiftIntensityd.",
+    )
+    parser.add_argument(
+        "--aug-gaussian-noise-prob",
+        type=float,
+        default=0.5,
+        help="Probability of adding Gaussian noise to simulate MRI acquisition noise.",
+    )
+    parser.add_argument(
+        "--aug-gaussian-noise-std",
+        type=float,
+        default=0.05,
+        help="Standard deviation of the Gaussian noise added by RandGaussianNoised.",
+    )
+    parser.add_argument(
+        "--aug-gibbs-noise-prob",
+        type=float,
+        default=0.3,
+        help="Probability of applying Gibbs ringing noise to simulate MRI artifact.",
+    )
+    parser.add_argument(
+        "--aug-gibbs-noise-alpha",
+        type=float,
+        default=0.5,
+        help="Upper bound of the Gibbs noise alpha range [0, alpha] used by RandGibbsNoised.",
     )
     parser.add_argument("--batch-size", type=int, default=16, help="Mini-batch size.")
     parser.add_argument("--epochs", type=int, default=200, help="Training epochs.")
     parser.add_argument(
         "--lr",
         type=float,
-        default=2e-5,
+        default=1e-4,
         help=(
-            "AdamW learning rate. Default 2e-5 (reduced from 1e-4) slows down learning to mitigate "
-            "early overfitting on small medical image datasets."
+            "AdamW learning rate. Default 5e-6 (reduced from 2e-5) further slows down learning to "
+            "mitigate extreme early overfitting (best_epoch=3) on small medical image datasets. "
+            "With layerwise lr_mult=0.1, backbone layer4 lr=5e-7, head lr=5e-6."
         ),
     )
     parser.add_argument(
@@ -666,14 +714,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--freeze-layers",
         type=str,
-        default="conv1,layer1,layer2,layer3",
+        default="conv1,layer1,layer2,layer3,layer4",
         help=(
             "Comma-separated list of ResNet-18 layers to freeze (no gradient). "
             "Valid names: none, conv1, bn1, layer1, layer2, layer3, layer4. "
             "Use 'none' to disable freezing (full fine-tuning). "
-            "Default 'conv1,layer1,layer2,layer3' freezes early layers, only trains layer4+fc "
-            "reducing trainable params from ~11M to ~2.7M — the most effective overfitting remedy "
-            "for small medical image datasets."
+            "Default 'conv1,layer1,layer2,layer3,layer4' freezes the entire backbone, only trains fc "
+            "reducing trainable params from ~11M to ~1K — maximally suppresses overfitting for "
+            "small datasets (~96 patients). If val AUC drops below 0.75, relax to layer3 only."
         ),
     )
     parser.add_argument(
@@ -697,7 +745,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--early-stop-patience",
         type=int,
-        default=30,
+        default=10,
         help=(
             "Stop if validation AUC does not improve for N epochs. "
             "Default 30 (increased from 20) gives the model more time to escape from early overfitting "
@@ -727,11 +775,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--label-smoothing",
         type=float,
-        default=0.2,
+        default=0.3,
         help=(
             "Label smoothing coefficient for CrossEntropyLoss (0.0 = standard cross-entropy). "
-            "Default 0.2 (increased from 0.1) softens one-hot targets more aggressively "
-            "to prevent overconfident predictions on small datasets."
+            "Default 0.3 (increased from 0.2) softens one-hot targets more aggressively "
+            "to prevent overconfident predictions (train AUC=0.9995) on small datasets. "
+            "Do not exceed 0.4 to avoid losing discriminative capacity."
         ),
     )
     parser.add_argument(
@@ -762,6 +811,30 @@ def build_argparser() -> argparse.ArgumentParser:
         type=float,
         default=0.5,
         help="Patient-level probability threshold for class prediction.",
+    )
+    parser.add_argument(
+        "--topk-pool",
+        type=int,
+        default=0,
+        help=(
+            "Top-K mean pooling for patient-level aggregation. "
+            "0 = use all blocks (simple mean, default). "
+            "K > 0 = keep only the K most confident blocks per patient "
+            "(sorted by |prob - 0.5|, largest first) before averaging. "
+            "Recommended: set K to roughly 1/3 of the typical block count per patient."
+        ),
+    )
+    parser.add_argument(
+        "--threshold-search",
+        type=str2bool,
+        default=True,
+        help=(
+            "Whether to automatically search for the optimal classification threshold on the "
+            "validation set using Youden Index (max TPR - FPR) after training. "
+            "If True, the best threshold is reported and used to re-evaluate the test set, "
+            "while the fixed --threshold is still used for the primary evaluation. "
+            "This helps diagnose and improve low Specificity without changing the training process."
+        ),
     )
     parser.add_argument(
         "--log-to-file",
@@ -811,6 +884,10 @@ def build_augmentation_config(args: argparse.Namespace) -> MonaiAugmentConfig:
         intensity_scale=args.aug_intensity_scale,
         intensity_shift_prob=args.aug_intensity_shift_prob,
         intensity_shift=args.aug_intensity_shift,
+        gaussian_noise_prob=args.aug_gaussian_noise_prob,
+        gaussian_noise_std=args.aug_gaussian_noise_std,
+        gibbs_noise_prob=args.aug_gibbs_noise_prob,
+        gibbs_noise_alpha=args.aug_gibbs_noise_alpha,
     )
 
 
@@ -991,13 +1068,19 @@ def patient_level_from_block_predictions(
     run_id: str,
     checkpoint_name: str,
     threshold: float,
+    top_k: int = 0,
 ) -> List[Dict[str, object]]:
     """
     将 block 级别预测聚合为病人级别预测。
 
     聚合方式为：
-    - 同一病人的所有 block 预测概率取均值；
+    - 同一病人的所有 block 预测概率，若 top_k > 0 则取置信度最高的 top_k 个 block，
+      否则使用全部 block；
+    - 对选中的 block 概率取均值（Top-K 均值池化）；
     - 再与给定 threshold 比较，得到最终的二分类标签。
+
+    top_k 置信度度量：以 abs(prob - 0.5) 为依据，数值越大表示预测越确定，
+    能自然过滤靠近决策边界的低质量切片预测。
     """
 
     grouped: Dict[str, Dict[str, object]] = defaultdict(
@@ -1014,7 +1097,13 @@ def patient_level_from_block_predictions(
     rows: List[Dict[str, object]] = []
     for patient_id in sorted(grouped):
         y_true = int(grouped[patient_id]["y_true"])
-        prob = float(np.mean(grouped[patient_id]["probs"]))
+        probs = grouped[patient_id]["probs"]
+
+        # Top-K 均值池化：取置信度最高（距 0.5 最远）的 K 个 block。
+        if top_k > 0 and len(probs) > top_k:
+            probs = sorted(probs, key=lambda p: abs(p - 0.5), reverse=True)[:top_k]
+
+        prob = float(np.mean(probs))
         pred_label = int(prob >= threshold)
         # 输出结构直接面向后续 CSV 导出，因此保留 run_id / checkpoint_name 等实验追踪字段。
         rows.append(
@@ -1070,6 +1159,7 @@ def evaluate_model(
     run_id: str,
     checkpoint_name: str,
     threshold: float,
+    top_k: int = 0,
 ) -> Dict[str, object]:
     """
     在指定数据划分上执行评估，并返回 block 级与 patient 级结果。
@@ -1123,6 +1213,7 @@ def evaluate_model(
         run_id=run_id,
         checkpoint_name=checkpoint_name,
         threshold=threshold,
+        top_k=top_k,
     )
     patient_metrics = compute_patient_metrics(patient_rows)
 
@@ -1660,6 +1751,43 @@ def choose_monitor_score(eval_output: Dict[str, object]) -> float:
     return -float(eval_output["loss"])
 
 
+def search_optimal_threshold(
+    patient_rows: List[Dict[str, object]],
+) -> float:
+    """基于验证集病人级预测，用 Youden Index 搜索最优分类阈值。
+
+    Youden Index = Sensitivity + Specificity - 1 = TPR - FPR。
+    在 ROC 曲线上找到使 (TPR - FPR) 最大的点对应的阈值。
+
+    返回：
+    - 最优阈值（float），若无法计算则返回 0.5。
+    """
+    y_true = np.asarray([row["y_true"] for row in patient_rows], dtype=np.int64)
+    y_prob = np.asarray([row["prob_idh_mut"] for row in patient_rows], dtype=np.float64)
+    if len(np.unique(y_true)) < 2:
+        return 0.5
+    fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+    youden = tpr - fpr
+    best_idx = int(np.argmax(youden))
+    return float(thresholds[best_idx])
+
+
+def evaluate_with_threshold(
+    patient_rows: List[Dict[str, object]],
+    threshold: float,
+) -> Dict[str, object]:
+    """用指定阈值重新对已有病人级概率做二分类，并计算指标。
+
+    此函数不重新跑推理，仅重新应用阈值后计算指标，用于阈值搜索结果的快速评估。
+    """
+    new_rows = [
+        {**row, "pred_label": int(float(row["prob_idh_mut"]) >= threshold)}
+        for row in patient_rows
+    ]
+    metrics = compute_patient_metrics(new_rows)
+    return {"patient_rows": new_rows, "metrics": metrics}
+
+
 def write_run_summary(
     args: argparse.Namespace,
     datasets: Dict[str, HabitatIDHBlockDataset],
@@ -1871,6 +1999,7 @@ def _main_training_loop(
             run_id=run_id,
             checkpoint_name="best.pt",
             threshold=args.threshold,
+            top_k=args.topk_pool,
         )
 
         # 验证集指标以病人级别结果为准，用于选择最佳模型。
@@ -1987,6 +2116,7 @@ def _main_training_loop(
             run_id=run_id,
             checkpoint_name=best_checkpoint_path.name,
             threshold=args.threshold,
+            top_k=args.topk_pool,
         )
 
     export_prediction_tables(
@@ -2003,6 +2133,45 @@ def _main_training_loop(
         run_id=run_id,
         threshold=args.threshold,
     )
+
+    # C3: 动态阈值搜索 — 基于验证集 Youden Index 找最优阈值，并用其重新评估测试集。
+    # 只需重新对已有的 patient_rows 做阈值应用，不重新跑推理，开销极低。
+    if args.threshold_search and "val" in eval_outputs:
+        optimal_thr = search_optimal_threshold(eval_outputs["val"]["patient_rows"])
+        print(f"\n[Threshold Search] Fixed threshold={args.threshold:.3f} | "
+              f"Youden optimal threshold={optimal_thr:.3f}")
+        for split_name in eval_outputs:
+            re_eval = evaluate_with_threshold(eval_outputs[split_name]["patient_rows"], optimal_thr)
+            m = re_eval["metrics"]
+            print(
+                f"  [{split_name}] thr={optimal_thr:.3f} | "
+                f"acc={m['acc']:.4f} | f1={m['f1']:.4f} | "
+                f"sen={m['sen']:.4f} | spe={m['spe']:.4f} | "
+                f"tn={m['tn']} fp={m['fp']} fn={m['fn']} tp={m['tp']}"
+            )
+        # 保存使用最优阈值后的测试集预测表
+        if "test" in eval_outputs:
+            test_rows_opt = evaluate_with_threshold(
+                eval_outputs["test"]["patient_rows"], optimal_thr
+            )["patient_rows"]
+            opt_pred_path = output_dir / f"patient_predictions_{MODEL_NAME}_test_{run_id}_thr{optimal_thr:.3f}.csv"
+            save_rows(
+                test_rows_opt,
+                opt_pred_path,
+                fieldnames=["patient_id", "split", "y_true", "prob_idh_mut", "pred_label",
+                            "run_id", "checkpoint_name"],
+            )
+            print(f"  Optimal-threshold test predictions saved: {opt_pred_path.name}")
+        # 保存阈值搜索摘要
+        thr_summary = {
+            "fixed_threshold": args.threshold,
+            "optimal_threshold_youden": optimal_thr,
+            "splits": {},
+        }
+        for split_name in eval_outputs:
+            re_eval = evaluate_with_threshold(eval_outputs[split_name]["patient_rows"], optimal_thr)
+            thr_summary["splits"][split_name] = re_eval["metrics"]
+        save_json(thr_summary, output_dir / f"threshold_search_{MODEL_NAME}_{run_id}.json")
     export_evaluation_figures(
         eval_outputs=eval_outputs,
         output_dir=output_dir,

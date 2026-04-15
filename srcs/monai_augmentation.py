@@ -19,6 +19,8 @@ try:
         EnsureTyped,
         RandAffined,
         RandFlipd,
+        RandGaussianNoised,
+        RandGibbsNoised,
         RandScaleIntensityd,
         RandStdShiftIntensityd,
         Resized,
@@ -28,6 +30,8 @@ except ImportError as exc:  # pragma: no cover - exercised only when MONAI is mi
     EnsureTyped = None
     RandAffined = None
     RandFlipd = None
+    RandGaussianNoised = None
+    RandGibbsNoised = None
     RandScaleIntensityd = None
     RandStdShiftIntensityd = None
     Resized = None
@@ -38,18 +42,24 @@ else:
 
 @dataclass(frozen=True)
 class MonaiAugmentConfig:
-    """Config for a conservative MRI augmentation policy."""
+    """Config for a strong MRI augmentation policy targeting small datasets."""
 
     enabled: bool = True
-    affine_prob: float = 0.5
-    rotate_deg: float = 10.0
-    translate_px: float = 8.0
-    scale_range: float = 0.1
+    affine_prob: float = 0.9
+    rotate_deg: float = 30.0
+    translate_px: float = 20.0
+    scale_range: float = 0.25
     flip_prob: float = 0.5
-    intensity_scale_prob: float = 0.3
-    intensity_scale: float = 0.1
-    intensity_shift_prob: float = 0.3
-    intensity_shift: float = 0.1
+    intensity_scale_prob: float = 0.5
+    intensity_scale: float = 0.25
+    intensity_shift_prob: float = 0.5
+    intensity_shift: float = 0.25
+    # Gaussian noise: simulate MRI acquisition noise
+    gaussian_noise_prob: float = 0.5
+    gaussian_noise_std: float = 0.05
+    # Gibbs noise: simulate MRI ringing artifact
+    gibbs_noise_prob: float = 0.3
+    gibbs_noise_alpha: float = 0.5
 
     def to_dict(self) -> Dict[str, float | bool]:
         """Return a JSON-safe config dictionary."""
@@ -185,6 +195,25 @@ def build_monai_block_transforms(
                 # VOI mask 的 0/1 值会显著拉低整体 std，使得实际偏移量偏小，
                 # 且各通道间的强度分布差异被抹平，改为 True 后每通道独立扰动更合理。
                 channel_wise=True,
+            )
+        )
+
+    if config.gaussian_noise_prob > 0.0 and config.gaussian_noise_std > 0.0:
+        train_ops.append(
+            RandGaussianNoised(
+                keys=["image"],
+                prob=config.gaussian_noise_prob,
+                mean=0.0,
+                std=float(config.gaussian_noise_std),
+            )
+        )
+
+    if config.gibbs_noise_prob > 0.0 and config.gibbs_noise_alpha > 0.0:
+        train_ops.append(
+            RandGibbsNoised(
+                keys=["image"],
+                prob=config.gibbs_noise_prob,
+                alpha=(0.0, float(config.gibbs_noise_alpha)),
             )
         )
 
