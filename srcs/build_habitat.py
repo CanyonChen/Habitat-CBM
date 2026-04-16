@@ -21,7 +21,22 @@ and IDH Mutation Status Prediction of Adult-type Diffuse Gliomas`
 ===============================================================================
 二、输入目录格式
 ===============================================================================
-脚本默认读取已经完成预处理的数据集根目录，即：
+脚本支持两种输入布局，其中默认推荐直接使用 `data_split.py` 的输出根目录：
+
+1. split 布局（推荐）：
+
+dataset_root/
+├── train/
+│   ├── conventional/
+│   └── functional/
+├── val/
+│   ├── conventional/
+│   └── functional/
+└── test/
+    ├── conventional/
+    └── functional/
+
+2. 旧版布局（兼容）：
 
 dataset_root/
 ├── idh.csv
@@ -53,25 +68,20 @@ dataset_root/
 ===============================================================================
 默认输出到：
 
-habitat_CBM/dataset/habitat_masks/
+habitat_CBM/results/02_habitat/habitat_masks/
 
-并按与数据集相似的目录风格组织：
+当输入为 split 布局时，输出按 split 分层组织：
 
 habitat_masks/
-├── mutant/
-│   ├── 005/
-│   │   ├── h1.nii.gz
-│   │   ├── h2.nii.gz
-│   │   ├── h3.nii.gz
-│   │   └── h12.nii.gz
-│   └── ...
-├── wild_type/
-│   ├── 003/
-│   │   ├── h1.nii.gz
-│   │   ├── h2.nii.gz
-│   │   ├── h3.nii.gz
-│   │   └── h12.nii.gz
-│   └── ...
+├── train/
+│   ├── mutant/<patient_id>/h1|h2|h3|h12.nii.gz
+│   └── wild_type/<patient_id>/h1|h2|h3|h12.nii.gz
+├── val/
+│   ├── mutant/<patient_id>/h1|h2|h3|h12.nii.gz
+│   └── wild_type/<patient_id>/h1|h2|h3|h12.nii.gz
+├── test/
+│   ├── mutant/<patient_id>/h1|h2|h3|h12.nii.gz
+│   └── wild_type/<patient_id>/h1|h2|h3|h12.nii.gz
 └── manifests/
     ├── habitat_centers.csv
     ├── habitat_volume_summary.csv
@@ -110,20 +120,20 @@ habitat_masks/
 1. 自动优先使用 GPU：
 
 python habitat_CBM/repo/srcs/build_habitat.py \
-    --dataset-root /path/to/images \
-    --output-root /path/to/habitat_CBM/dataset/habitat_masks \
+    --dataset-root /path/to/splited_data \
+    --output-root /path/to/habitat_CBM/results/02_habitat/habitat_masks \
     --device auto
 
 2. 强制使用 GPU：
 
 python habitat_CBM/repo/srcs/build_habitat.py \
-    --dataset-root /path/to/images \
+    --dataset-root /path/to/splited_data \
     --device cuda:0
 
 3. 强制使用 CPU：
 
 python habitat_CBM/repo/srcs/build_habitat.py \
-    --dataset-root /path/to/images \
+    --dataset-root /path/to/splited_data \
     --device cpu
 """
 
@@ -167,11 +177,34 @@ except Exception:  # pragma: no cover - 运行环境可能没有 sklearn
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]  # habitat_CBM/
-DEFAULT_DATASET_ROOT = PROJECT_ROOT / "dataset" / "images"
+
+
+def resolve_default_dataset_root() -> Path:
+    """按优先级推断默认输入目录。
+
+    优先使用 data_split.py 的输出目录（train/val/test 在其下），
+    若不存在则回退到旧版数据根目录。
+    """
+
+    candidates = [
+        # PROJECT_ROOT / "data" / "splited_data",
+        PROJECT_ROOT / "dataset" / "splited_data",
+        # PROJECT_ROOT / "data" / "images",
+        # PROJECT_ROOT / "dataset" / "images",
+        # PROJECT_ROOT / "dataset",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+DEFAULT_DATASET_ROOT = resolve_default_dataset_root()
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "dataset" / "habitat_masks"
 
 BRANCHES = ("conventional", "functional")
 LABEL_TO_ID = {"wild_type": 0, "mutant": 1}
+KNOWN_SPLITS = ("train", "val", "test")
 ALLOWED_EXTENSIONS = (".nii", ".nii.gz", ".mha", ".mhd", ".nrrd")
 DEFAULT_VOI_KEYWORDS = ("voi",)
 
@@ -200,6 +233,7 @@ SEMANTIC_TEMPLATES = np.asarray(
 class PatientCase:
     """患者级 habitat 构建所需的最小信息。"""
 
+    split_name: str
     patient_id: str
     label_name: str
     label_id: int
@@ -323,7 +357,7 @@ def score_voi_candidate(path: Path) -> int:
     return score
 
 
-def discover_patient_dirs(dataset_root: Path) -> Dict[str, Dict[str, Path]]:
+def discover_patient_dirs(case_root: Path) -> Dict[str, Dict[str, Path]]:
     """扫描数据根目录，收集所有患者在两个分支下的患者文件夹路径。
 
     返回结构：
@@ -340,7 +374,7 @@ def discover_patient_dirs(dataset_root: Path) -> Dict[str, Dict[str, Path]]:
     patient_map: Dict[str, Dict[str, Path]] = {}
 
     for branch in BRANCHES:
-        branch_root = dataset_root / branch
+        branch_root = case_root / branch
         if not branch_root.is_dir():
             raise FileNotFoundError(f"Missing branch directory: {branch_root}")
 
@@ -371,6 +405,43 @@ def discover_patient_dirs(dataset_root: Path) -> Dict[str, Dict[str, Path]]:
                 )
 
     return patient_map
+
+
+def resolve_case_roots(dataset_root: Path) -> List[Tuple[str, Path]]:
+    """解析病例扫描根目录。
+
+    支持两种输入布局：
+    1. split 布局（推荐）：dataset_root/train|val|test/{conventional,functional}/...
+    2. 旧版布局：dataset_root/{conventional,functional}/...
+    """
+
+    split_roots: List[Tuple[str, Path]] = []
+    for split_name in KNOWN_SPLITS:
+        candidate = dataset_root / split_name
+        if candidate.is_dir():
+            split_roots.append((split_name, candidate))
+
+    if split_roots:
+        for split_name, split_root in split_roots:
+            for branch in BRANCHES:
+                branch_root = split_root / branch
+                if not branch_root.is_dir():
+                    raise FileNotFoundError(
+                        f"Split root detected but missing branch directory: {branch_root} "
+                        f"(split={split_name})"
+                    )
+        return split_roots
+
+    # 回退到旧版单根目录布局。
+    for branch in BRANCHES:
+        branch_root = dataset_root / branch
+        if not branch_root.is_dir():
+            raise FileNotFoundError(
+                f"Missing branch directory: {branch_root}. "
+                "Expected either split layout (train/val/test) or legacy layout "
+                "(conventional + functional under dataset-root)."
+            )
+    return [("all", dataset_root)]
 
 
 def discover_modality_file(functional_dir: Path, modality: str) -> Path:
@@ -416,24 +487,28 @@ def discover_voi_file(functional_dir: Path) -> Path:
 def build_patient_cases(dataset_root: Path) -> List[PatientCase]:
     """扫描数据根目录并构造全部 PatientCase。"""
 
-    patient_dirs = discover_patient_dirs(dataset_root)
     cases: List[PatientCase] = []
 
-    for patient_id in sorted(patient_dirs):
-        entry = patient_dirs[patient_id]
-        label_name = str(entry["label_name"])
-        functional_dir = Path(entry["functional"])
+    case_roots = resolve_case_roots(dataset_root)
+    for split_name, case_root in case_roots:
+        patient_dirs = discover_patient_dirs(case_root)
 
-        cases.append(
-            PatientCase(
-                patient_id=patient_id,
-                label_name=label_name,
-                label_id=LABEL_TO_ID[label_name],
-                adc_path=discover_modality_file(functional_dir, "adc"),
-                cbf_path=discover_modality_file(functional_dir, "cbf"),
-                voi_path=discover_voi_file(functional_dir),
+        for patient_id in sorted(patient_dirs):
+            entry = patient_dirs[patient_id]
+            label_name = str(entry["label_name"])
+            functional_dir = Path(entry["functional"])
+
+            cases.append(
+                PatientCase(
+                    split_name=split_name,
+                    patient_id=patient_id,
+                    label_name=label_name,
+                    label_id=LABEL_TO_ID[label_name],
+                    adc_path=discover_modality_file(functional_dir, "adc"),
+                    cbf_path=discover_modality_file(functional_dir, "cbf"),
+                    voi_path=discover_voi_file(functional_dir),
+                )
             )
-        )
 
     return cases
 
@@ -866,13 +941,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--dataset-root",
         type=Path,
         default=DEFAULT_DATASET_ROOT,
-        help="输入数据根目录，内部需包含 conventional/ 与 functional/；默认 habitat_CBM/dataset。",
+        help=(
+            "输入数据根目录。优先推荐 data_split.py 的输出根目录（内部包含 train/val/test）；"
+            "也兼容旧版 conventional/ + functional/ 直连布局。"
+        ),
     )
     parser.add_argument(
         "--output-root",
         type=Path,
         default=DEFAULT_OUTPUT_ROOT,
-        help="Habitat 输出根目录；默认 habitat_CBM/dataset/habitat_masks。",
+        help=(
+            "Habitat 输出根目录。若输入是 split 布局，则输出按 split 分层："
+            "<output-root>/<split>/<label>/<patient_id>/h1|h2|h3|h12.nii.gz。"
+        ),
     )
     parser.add_argument(
         "--device",
@@ -1001,6 +1082,10 @@ def main() -> None:
     if len(cases) == 0:
         raise RuntimeError("No patients matched the current filters.")
 
+    split_counts: Dict[str, int] = {}
+    for case in cases:
+        split_counts[case.split_name] = split_counts.get(case.split_name, 0) + 1
+
     print("=" * 80)
     print("Build Habitat Masks")
     print("=" * 80)
@@ -1013,6 +1098,7 @@ def main() -> None:
     print(f"max_iter          : {args.max_iter}")
     print(f"allow_non_gzip    : {args.allow_non_gzip_nii_gz}")
     print(f"overwrite_existing: {args.overwrite_existing}")
+    print(f"splits            : {split_counts}")
     if torch is not None and torch_device is not None and torch_device.type == "cuda":
         gpu_name = torch.cuda.get_device_name(torch_device)
         print(f"GPU               : {gpu_name}")
@@ -1101,7 +1187,10 @@ def main() -> None:
             h3 = (habitat3 == 3).astype(np.uint8)
             h12 = ((habitat3 == 1) | (habitat3 == 2)).astype(np.uint8)
 
-            patient_output_dir = output_root / case.label_name / case.patient_id
+            if case.split_name == "all":
+                patient_output_dir = output_root / case.label_name / case.patient_id
+            else:
+                patient_output_dir = output_root / case.split_name / case.label_name / case.patient_id
             maybe_remove_patient_dir(patient_output_dir, overwrite_existing=args.overwrite_existing)
             save_mask(h1, reference_img=adc_img, path=patient_output_dir / "h1.nii.gz")
             save_mask(h2, reference_img=adc_img, path=patient_output_dir / "h2.nii.gz")
@@ -1120,6 +1209,7 @@ def main() -> None:
                 centers_rows.append(
                     {
                         "patient_id": case.patient_id,
+                        "split": case.split_name,
                         "label_name": case.label_name,
                         "cluster_mapped": habitat_name,
                         "adc_center_raw": float(cluster_result.adc_centers_mapped[habitat_id - 1]),
@@ -1132,6 +1222,7 @@ def main() -> None:
             volume_rows.append(
                 {
                     "patient_id": case.patient_id,
+                    "split": case.split_name,
                     "label_name": case.label_name,
                     "tumor_volume": tumor_volume,
                     "h1_volume": h1_volume,
@@ -1162,6 +1253,7 @@ def main() -> None:
             qc_rows.append(
                 {
                     "patient_id": case.patient_id,
+                    "split": case.split_name,
                     "label_name": case.label_name,
                     "backend": cluster_result.backend,
                     "voi_nonzero_voxels": tumor_volume,
@@ -1194,6 +1286,7 @@ def main() -> None:
             failed_rows.append(
                 {
                     "patient_id": case.patient_id,
+                    "split": case.split_name,
                     "label_name": case.label_name,
                     "error": error_message,
                 }
@@ -1214,6 +1307,7 @@ def main() -> None:
         "script": "build_habitat.py",
         "dataset_root": str(dataset_root),
         "output_root": str(output_root),
+        "split_counts": split_counts,
         "num_patients_requested": len(cases),
         "num_patients_succeeded": len(volume_rows),
         "num_patients_failed": len(failed_rows),
