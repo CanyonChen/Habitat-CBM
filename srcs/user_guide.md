@@ -15,9 +15,11 @@
 6. [monai_augmentation.py - 数据增强](#monai_augmentationpy---数据增强)
 7. [baseline_ResNet18.py - 基线训练](#baseline_resnet18py---基线训练)
 8. [baseline_RadiomicsLR.py - 传统影像组学基线](#baseline_radiomicslrpy---传统影像组学基线)
-9. [典型工作流程](#典型工作流程)
-10. [数据流说明](#数据流说明)
-11. [常见问题排查](#常见问题排查)
+9. [train_habitat_CBM.py - Habitat-CBM 训练解耦工具](#train_habitat_cbmpy---habitat-cbm-训练解耦工具)
+10. [eval_habitat_CBM.py - Habitat-CBM 推理与验证解耦工具](#eval_habitat_cbmpy---habitat-cbm-推理与验证解耦工具)
+11. [典型工作流程](#典型工作流程)
+12. [数据流说明](#数据流说明)
+13. [常见问题排查](#常见问题排查)
 
 ---
 
@@ -78,6 +80,12 @@ python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
     --output-root /path/to/results/baseline_RadiomicsLR \
     --n-jobs 20 \
     --cv-folds 5
+
+# 6.（可选）Habitat-CBM 训练逻辑自检
+python habitat_CBM/repo/srcs/train_habitat_CBM.py --stage stage3
+
+# 7.（可选）Habitat-CBM 推理/干预逻辑自检
+python habitat_CBM/repo/srcs/eval_habitat_CBM.py --k 2
 ```
 
 ---
@@ -92,6 +100,8 @@ python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
 | `monai_augmentation.py` | 数据增强 | 提供训练时的数据增强变换 | Dataset samples | Augmented samples |
 | `baseline_ResNet18.py` | 基线训练 | 训练 ResNet-18 进行 IDH 分类 | 划分后的数据 | 模型、预测、指标 |
 | `baseline_RadiomicsLR.py` | 传统影像组学基线 | 提取 PyRadiomics 特征并训练 LASSO Logistic Regression | 划分后的 `conventional/` 数据 | 特征表、模型、预测、指标 |
+| `train_habitat_CBM.py` | Habitat-CBM 训练工具 | 提供 stage 冻结、loss、参数组、step 模板（与模型解耦） | `HabitatCBM` + 张量批次 | 训练期中间结果（loss/tensor） |
+| `eval_habitat_CBM.py` | Habitat-CBM 评估工具 | 提供批量推理、TTI 干预、患者级聚合（与模型解耦） | `HabitatCBM` + 推理批次 | 预测/干预结果与聚合结果 |
 
 ---
 
@@ -952,6 +962,91 @@ python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
 
 ---
 
+## train_habitat_CBM.py - Habitat-CBM 训练解耦工具
+
+### 功能描述
+
+`train_habitat_CBM.py` 不是完整的训练主脚本，而是一个**训练逻辑工具层**。  
+它把以下内容从 `models/habitat_CBM.py` 中解耦出来：
+
+1. 三阶段冻结策略（`stage1/stage2/stage3`）
+2. 参数组构建（`encoder/concept_head/label_head`）
+3. `MSE/BCEWithLogits/Joint` 损失定义
+4. stage 级别最小训练 step 模板
+
+### 核心接口
+
+| 函数 | 作用 |
+|------|------|
+| `set_train_stage(model, stage)` | 设置阶段冻结策略 |
+| `get_param_groups(model, lr_encoder, lr_concept_head, lr_label_head)` | 生成优化器参数组 |
+| `compute_concept_loss(model, c_hat, c_true_std)` | 概念回归损失（MSE） |
+| `compute_label_loss(y_logit, y_true)` | 标签二分类损失（BCEWithLogits） |
+| `compute_joint_loss(...)` | 联合损失 |
+| `stage1_train_step(...)` | Stage1（X->C）最小 step |
+| `stage2_train_step(...)` | Stage2（C->Y）最小 step |
+| `stage3_train_step(...)` | Stage3（X->C->Y）最小 step |
+
+### 最小用法示例
+
+```bash
+# 随机张量自检（默认 stage3）
+python habitat_CBM/repo/srcs/train_habitat_CBM.py --stage stage3
+
+# 检查 Stage1 逻辑
+python habitat_CBM/repo/srcs/train_habitat_CBM.py --stage stage1
+
+# 检查 Stage2 逻辑
+python habitat_CBM/repo/srcs/train_habitat_CBM.py --stage stage2
+```
+
+### 设计建议
+
+1. 把 dataloader、epoch、early-stop、日志导出放在你后续的主训练脚本里。
+2. 主训练脚本内部直接调用该工具文件的函数，保持职责清晰。
+3. 不要把 loss 或 stage 逻辑重新写回 `models/habitat_CBM.py`。
+
+---
+
+## eval_habitat_CBM.py - Habitat-CBM 推理与验证解耦工具
+
+### 功能描述
+
+`eval_habitat_CBM.py` 承担推理/验证工具职责，和模型结构解耦。  
+它提供三类能力：
+
+1. 常规推理：`predict_batch`
+2. 概念干预：`forward_with_intervention`
+3. 患者级聚合：概率聚合与概念聚合
+
+### 核心接口
+
+| 函数 | 作用 |
+|------|------|
+| `predict_batch(model, x)` | 输出 `z/c_hat/y_logit/y_prob` |
+| `prepare_intervention_order(...)` | 生成或校验概念替换顺序 |
+| `forward_with_intervention(model, x, c_true_std, k, order=None)` | 执行 TTI 干预 |
+| `aggregate_patient_probabilities(patient_ids, probs, topk=0)` | block->patient 概率聚合 |
+| `aggregate_patient_concepts(patient_ids, concepts)` | block->patient 概念聚合 |
+
+### 最小用法示例
+
+```bash
+# 随机张量自检
+python habitat_CBM/repo/srcs/eval_habitat_CBM.py --k 2
+
+# 预算为全部概念（默认 n_concepts=8）
+python habitat_CBM/repo/srcs/eval_habitat_CBM.py --k 8
+```
+
+### 干预策略说明
+
+1. 当 `order=None` 时，默认按 `|c_pred - c_true_std|` 从大到小选概念。
+2. `k` 为干预预算，`k > n_concepts` 会自动截断为 `n_concepts`。
+3. `order` 若手动提供，必须是概念索引的合法排列。
+
+---
+
 ## 典型工作流程
 
 ### 完整实验流程
@@ -1295,3 +1390,88 @@ PyRadiomics 和 sklearn 的 L1 LogisticRegressionCV 都主要走 CPU
 ---
 
 > 本指南由 AI 助手根据源代码自动生成，如有疑问请参考源码中的详细注释。
+
+---
+
+## 2026-04-18 更新：Habitat-CBM 完整流程（JSON 配置驱动）
+
+本次更新后，Habitat-CBM 不再仅是工具函数自检，已支持完整训练-评估-干预闭环。
+
+### 新增脚本
+
+1. `build_habitat_cbm_labels.py`：构建 `concept_labels.csv`、`concept_statistics.csv`、`concept_scaler_stats.json`
+2. `eval_habitat_cbm_concepts.py`：概念层指标评估（`MAE/RMSE/R2/Pearson`）
+3. `intervene_habitat_cbm.py`：患者级概念干预（`k=1,2,4,all`）
+
+### 训练脚本行为更新
+
+`train_habitat_CBM.py` 现已支持：
+
+1. `--config`（默认读取 `args_train_habitat_CBM.json`）
+2. CLI 覆盖：`--run-id`、`--output-root`、`--checkpoint-root`、`--device`、`--epochs-stage1/2/3`、`--batch-size`
+3. 三阶段训练 + 早停 + 分阶段 best checkpoint
+4. 训练结束自动患者级评估导出
+
+### 数据加载器更新
+
+`data_loader_habitat_CBM.py` 现已在 `HabitatIDHBlockDataset` 上直接扩展 concept 模式。
+
+新增参数：
+
+1. `--concept-label-csv`
+2. `--concept-scaler-json`
+
+开启后输出新增字段：
+
+1. `concept_true_raw`（8 维）
+2. `concept_true_std`（8 维）
+
+### 一次跑通命令顺序
+
+```bash
+# 1) 构建 concept 资产
+python habitat_CBM/repo/srcs/build_habitat_cbm_labels.py \
+  --concept-proxy-csv habitat_CBM/results/02_habitat/concept_proxy_features_run01.csv \
+  --output-label-csv habitat_CBM/results/02_habitat/concept_labels.csv \
+  --output-stats-csv habitat_CBM/results/02_habitat/concept_statistics.csv \
+  --output-scaler-json habitat_CBM/results/03_habitat_cbm/concept_scaler_stats.json
+
+# 2) 三阶段训练（自动评估）
+python habitat_CBM/repo/srcs/train_habitat_CBM.py \
+  --config habitat_CBM/repo/srcs/args_train_habitat_CBM.json \
+  --run-id run01 \
+  --device cuda:0
+
+# 3) 概念层评估
+python habitat_CBM/repo/srcs/eval_habitat_cbm_concepts.py \
+  --patient-concepts-csv habitat_CBM/results/03_habitat_cbm/run01/patient_concepts_habitat_cbm_run01.csv \
+  --output-dir habitat_CBM/results/04_concept_eval/run01 \
+  --split test \
+  --scale raw
+
+# 4) 概念干预
+python habitat_CBM/repo/srcs/intervene_habitat_cbm.py \
+  --checkpoint habitat_CBM/runs/03_habitat_cbm/run01/checkpoints/stage3_best.pt \
+  --patient-predictions-csv habitat_CBM/results/03_habitat_cbm/run01/patient_predictions_habitat_cbm_run01.csv \
+  --patient-concepts-csv habitat_CBM/results/03_habitat_cbm/run01/patient_concepts_habitat_cbm_run01.csv \
+  --concept-scaler-json habitat_CBM/results/03_habitat_cbm/concept_scaler_stats.json \
+  --output-dir habitat_CBM/results/05_intervention/run01 \
+  --split test \
+  --budgets 1,2,4,all
+```
+
+### 关键输出对照
+
+1. 主任务：`patient_predictions_*`、`metrics_*`、`roc_points_*`、`confusion_matrix_*`、`wrong_cases_*`
+2. 概念层：`patient_concepts_*`、`concept_metrics_*`、`concept_error_*`
+3. 干预层：`intervention_case_list.csv`、`intervention_per_case.csv`、`intervention_metrics_by_budget.csv`、`intervention_correction_summary.csv`
+
+### 环境说明
+
+若当前环境缺少 `torch`，可先执行语法检查：
+
+```bash
+python -m py_compile habitat_CBM/repo/srcs/train_habitat_CBM.py
+```
+
+真实训练/推理/干预需在具备 `torch`、`monai`、`nibabel`、`scikit-learn` 的环境运行。
