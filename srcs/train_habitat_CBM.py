@@ -153,6 +153,72 @@ def _set_requires_grad(module: nn.Module, flag: bool) -> None:
         p.requires_grad = flag
 
 
+_VALID_ENCODER_LAYERS = ("conv1", "bn1", "layer1", "layer2", "layer3", "layer4")
+
+
+def _parse_freeze_encoder_layers(value: object) -> List[str]:
+    """解析 freeze_encoder_layers 配置，返回需要冻结的 encoder 层名列表。
+
+    支持以下格式：
+    - null / None / 空列表：不冻结任何层
+    - JSON 数组：["conv1", "layer1", "layer2"]
+    - 逗号分隔字符串："conv1,layer1,layer2"
+    可用层名：conv1、bn1、layer1、layer2、layer3、layer4。
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped or stripped.lower() == "none":
+            return []
+        names = [n.strip() for n in stripped.split(",") if n.strip() and n.strip().lower() != "none"]
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        names = [str(n).strip() for n in value if str(n).strip() and str(n).strip().lower() != "none"]
+    else:
+        raise ValueError(
+            f"freeze_encoder_layers must be null, a list, or a comma-separated string. Got: {value!r}"
+        )
+
+    invalid = [n for n in names if n not in _VALID_ENCODER_LAYERS]
+    if invalid:
+        raise ValueError(
+            f"Invalid freeze_encoder_layers name(s): {invalid}. "
+            f"Valid names: {list(_VALID_ENCODER_LAYERS)}"
+        )
+    return names
+
+
+def _apply_stage1_encoder_freeze(model: HabitatCBM, freeze_layer_names: List[str]) -> None:
+    """对 Stage1 encoder 中指定层执行冻结，并打印冻结摘要。"""
+    _apply_encoder_freeze(model, freeze_layer_names, stage="stage1")
+
+
+def _apply_encoder_freeze(model: HabitatCBM, freeze_layer_names: List[str], stage: str = "stage") -> None:
+    """对 encoder 中指定层执行冻结，并打印冻结摘要。可用于任意训练阶段。"""
+    if not freeze_layer_names:
+        trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
+        print(f"[{stage}] encoder freeze: none (full fine-tune, trainable={trainable:,})")
+        return
+
+    frozen_params = 0
+    for layer_name in freeze_layer_names:
+        layer = getattr(model.encoder, layer_name, None)
+        if layer is None:
+            raise ValueError(
+                f"freeze_encoder_layers: layer '{layer_name}' not found in encoder. "
+                f"Valid names: {list(_VALID_ENCODER_LAYERS)}"
+            )
+        for p in layer.parameters():
+            p.requires_grad = False
+            frozen_params += p.numel()
+
+    trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
+    print(
+        f"[{stage}] encoder freeze: {freeze_layer_names} "
+        f"(frozen={frozen_params:,}, trainable={trainable:,})"
+    )
+
+
 def set_train_stage(model: HabitatCBM, stage: str) -> TrainStage:
     stage_name = normalize_stage_name(stage)
     if stage_name == "stage1":
@@ -635,6 +701,72 @@ def _safe_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     from sklearn.metrics import roc_auc_score
 
     return float(roc_auc_score(y_true, y_prob))
+
+
+def find_youden_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """在 val 集上用 Youden Index (Sensitivity + Specificity - 1) 最大化选取最优阈值。
+
+    Args:
+        y_true: 真实标签 (0/1)，shape [N]
+        y_prob: 预测概率，shape [N]
+
+    Returns:
+        使 Youden Index 最大的阈值；如果类别少于 2 则回退到 0.5。
+    """
+    if len(np.unique(y_true)) < 2:
+        return 0.5
+
+    from sklearn.metrics import roc_curve
+
+    fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+    # Youden J = Sensitivity + Specificity - 1 = tpr + (1 - fpr) - 1 = tpr - fpr
+    j_scores = tpr - fpr
+    best_idx = int(np.argmax(j_scores))
+    best_threshold = float(thresholds[best_idx])
+    # 限制到合理范围，避免 roc_curve 返回 threshold > 1 的边界值
+    best_threshold = float(np.clip(best_threshold, 1e-6, 1.0 - 1e-6))
+    return best_threshold
+
+
+def collect_val_patient_probs(
+    model: HabitatCBM,
+    val_loader,
+    device: torch.device,
+    topk_pool: int,
+    threshold: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """在 val 集上收集患者级预测概率，用于 Youden Index 阈值选取。
+
+    Returns:
+        (y_true_patient, y_prob_patient) 两个 numpy 数组。
+    """
+    model.eval()
+    patient_ids: List[str] = []
+    probs: List[float] = []
+    y_true_blocks: List[int] = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            x = batch["image"].to(device=device, dtype=torch.float32, non_blocking=True)
+            y_true = batch["label"].to(device=device, dtype=torch.float32, non_blocking=True)
+            out = model.forward_x_to_cy(x)
+            y_prob = torch.sigmoid(out["y_logit"]).squeeze(1)
+
+            batch_size = int(x.shape[0])
+            batch_patient_ids = batch["patient_id"]
+            for idx in range(batch_size):
+                patient_ids.append(str(batch_patient_ids[idx]))
+                probs.append(float(y_prob[idx].item()))
+                y_true_blocks.append(int(y_true[idx].item()))
+
+    y_true_p, y_prob_p, _ = _patient_level_probs(
+        patient_ids=patient_ids,
+        probs=probs,
+        y_trues=y_true_blocks,
+        topk_pool=topk_pool,
+        threshold=threshold,
+    )
+    return y_true_p, y_prob_p
 
 
 def _patient_level_probs(
@@ -1474,6 +1606,21 @@ def main() -> None:
 
     for stage_name, epochs, ckpt_path, log_path, stage_cfg in stage_cfgs:
         stage = set_train_stage(model, stage_name)
+
+        # Stage1：根据配置冻结 encoder 浅层，抑制小样本过拟合
+        if stage == "stage1":
+            freeze_layer_names = _parse_freeze_encoder_layers(
+                stage_cfg.get("freeze_encoder_layers", None)
+            )
+            _apply_encoder_freeze(model, freeze_layer_names, stage="stage1")
+
+        # Stage3：同样支持冻结 encoder 浅层，防止联合微调时特征提取层大幅偏移
+        if stage == "stage3":
+            freeze_layer_names = _parse_freeze_encoder_layers(
+                stage_cfg.get("freeze_encoder_layers", None)
+            )
+            _apply_encoder_freeze(model, freeze_layer_names, stage="stage3")
+
         stage2_patient_level = bool(stage_cfg.get("patient_level", False))
         stage2_concept_noise_std = float(stage_cfg.get("concept_noise_std", 0.0))
         if stage2_concept_noise_std < 0.0:
@@ -1554,11 +1701,29 @@ def main() -> None:
             "scheduler_step_mode": scheduler_step_mode,
             "stage2_patient_level": stage2_patient_level if stage == "stage2" else False,
             "stage2_concept_noise_std": stage2_concept_noise_std if stage == "stage2" else 0.0,
+            "frozen_encoder_layers": freeze_layer_names if stage in ("stage1", "stage3") else [],
         }
         stage_checkpoint_paths[stage] = ckpt_path
 
     stage3_ckpt = stage_checkpoint_paths.get("stage3", checkpoint_root / "stage3_best.pt")
     _load_checkpoint_model_only(model, stage3_ckpt, device=device)
+
+    # ── 用 val 集 Youden Index 动态选取最优阈值 ──────────────────────────────
+    print("[eval] Computing optimal threshold via Youden Index on val set ...")
+    val_y_true, val_y_prob = collect_val_patient_probs(
+        model=model,
+        val_loader=dataloaders["val"],
+        device=device,
+        topk_pool=topk_pool,
+        threshold=threshold,  # 此处 threshold 仅用于 topk 聚合，不影响 Youden 计算
+    )
+    youden_threshold = find_youden_threshold(val_y_true, val_y_prob)
+    print(
+        f"[eval] Fixed threshold={threshold:.4f}  →  Youden threshold={youden_threshold:.4f} "
+        f"(val n={len(val_y_true)}, pos={int(val_y_true.sum())}, neg={int((1-val_y_true).sum())})"
+    )
+    eval_threshold = youden_threshold
+    # ─────────────────────────────────────────────────────────────────────────
 
     include_splits = tuple(eval_cfg.get("include_splits", ["train", "val", "test"]))
     figure_include_splits = tuple(eval_cfg.get("figure_include_splits", include_splits))
@@ -1569,7 +1734,7 @@ def main() -> None:
         output_dir=result_dir,
         run_id=run_id,
         checkpoint_name=stage3_ckpt.name,
-        threshold=threshold,
+        threshold=eval_threshold,
         topk_pool=topk_pool,
         device=device,
         include_splits=include_splits,
@@ -1602,6 +1767,11 @@ def main() -> None:
         },
         "class_balance": {
             "pos_weight": float(pos_weight.item()) if pos_weight is not None else None,
+        },
+        "threshold": {
+            "fixed_threshold": threshold,
+            "youden_threshold": float(youden_threshold),
+            "eval_threshold_used": float(eval_threshold),
         },
         "loss": effective_loss_cfg,
         "optimizer": dict(optimizer_cfg),
