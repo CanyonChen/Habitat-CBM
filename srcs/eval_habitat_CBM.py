@@ -13,15 +13,36 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
+import re
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, roc_auc_score, roc_curve
+from sklearn.calibration import calibration_curve
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    precision_recall_curve,
+    roc_auc_score,
+    roc_curve,
+)
+
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    HAS_MATPLOTLIB = True
+except Exception:  # pragma: no cover - matplotlib 缺失时不影响 CSV/JSON 导出
+    HAS_MATPLOTLIB = False
 
 CURRENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CURRENT_DIR.parent
@@ -447,6 +468,380 @@ def evaluate_split(
     }
 
 
+def _extract_binary_arrays(patient_rows: Sequence[Mapping[str, object]]) -> Tuple[np.ndarray, np.ndarray]:
+    y_true = np.asarray([int(row["y_true"]) for row in patient_rows], dtype=np.int64)
+    y_prob = np.asarray([float(row["prob_idh_mut"]) for row in patient_rows], dtype=np.float64)
+    return y_true, y_prob
+
+
+def _plot_roc_curve(
+    patient_rows: Sequence[Mapping[str, object]],
+    path: Path,
+    title: str,
+    dpi: int,
+) -> bool:
+    y_true, y_prob = _extract_binary_arrays(patient_rows)
+    if len(np.unique(y_true)) < 2:
+        return False
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    auc_value = _safe_auc(y_true, y_prob)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(5.5, 5.0), dpi=dpi)
+    ax.plot(fpr, tpr, color="#1f77b4", linewidth=2.0, label=f"AUC = {auc_value:.3f}")
+    ax.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", color="#999999", linewidth=1.2)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.05)
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title(title)
+    ax.legend(loc="lower right")
+    ax.grid(alpha=0.2, linewidth=0.5)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _plot_pr_curve(
+    patient_rows: Sequence[Mapping[str, object]],
+    path: Path,
+    title: str,
+    dpi: int,
+) -> bool:
+    y_true, y_prob = _extract_binary_arrays(patient_rows)
+    if len(np.unique(y_true)) < 2:
+        return False
+    precision, recall, _ = precision_recall_curve(y_true, y_prob)
+    ap = float(average_precision_score(y_true, y_prob))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(5.5, 5.0), dpi=dpi)
+    ax.plot(recall, precision, color="#ff7f0e", linewidth=2.0, label=f"AP = {ap:.3f}")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.05)
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title(title)
+    ax.legend(loc="lower left")
+    ax.grid(alpha=0.2, linewidth=0.5)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _plot_confusion_matrix(
+    patient_rows: Sequence[Mapping[str, object]],
+    path: Path,
+    title: str,
+    dpi: int,
+) -> None:
+    y_true = np.asarray([int(row["y_true"]) for row in patient_rows], dtype=np.int64)
+    y_pred = np.asarray([int(row["pred_label"]) for row in patient_rows], dtype=np.int64)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    matrix = np.asarray([[tn, fp], [fn, tp]], dtype=np.int64)
+    labels = (("TN", "FP"), ("FN", "TP"))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(5.0, 4.5), dpi=dpi)
+    image = ax.imshow(matrix, cmap="Blues")
+    plt.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_xticks([0, 1], labels=["Pred 0", "Pred 1"])
+    ax.set_yticks([0, 1], labels=["True 0", "True 1"])
+    ax.set_title(title)
+    max_value = max(int(matrix.max()), 1)
+    for row_idx in range(matrix.shape[0]):
+        for col_idx in range(matrix.shape[1]):
+            value = int(matrix[row_idx, col_idx])
+            text_color = "white" if value > max_value / 2 else "black"
+            ax.text(
+                col_idx,
+                row_idx,
+                f"{labels[row_idx][col_idx]}\n{value}",
+                ha="center",
+                va="center",
+                color=text_color,
+                fontsize=10,
+            )
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_calibration_curve(
+    patient_rows: Sequence[Mapping[str, object]],
+    path: Path,
+    title: str,
+    dpi: int,
+) -> bool:
+    y_true, y_prob = _extract_binary_arrays(patient_rows)
+    if len(np.unique(y_true)) < 2:
+        return False
+    n_bins = max(4, min(10, int(len(y_true) / 2)))
+    prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=n_bins, strategy="uniform")
+    if len(prob_true) == 0:
+        return False
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(5.5, 5.0), dpi=dpi)
+    ax.plot(prob_pred, prob_true, marker="o", linewidth=1.8, color="#2ca02c", label="Model")
+    ax.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", color="#999999", linewidth=1.2, label="Perfect")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel("Mean Predicted Probability")
+    ax.set_ylabel("Fraction of Positives")
+    ax.set_title(title)
+    ax.legend(loc="upper left")
+    ax.grid(alpha=0.2, linewidth=0.5)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _plot_probability_distribution(
+    patient_rows: Sequence[Mapping[str, object]],
+    path: Path,
+    title: str,
+    dpi: int,
+) -> bool:
+    y_true, y_prob = _extract_binary_arrays(patient_rows)
+    pos = y_prob[y_true == 1]
+    neg = y_prob[y_true == 0]
+    if pos.size == 0 and neg.size == 0:
+        return False
+
+    bins = np.linspace(0.0, 1.0, 21)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(6.0, 4.5), dpi=dpi)
+    if neg.size > 0:
+        ax.hist(neg, bins=bins, alpha=0.55, color="#1f77b4", label=f"True 0 (n={neg.size})", density=False)
+    if pos.size > 0:
+        ax.hist(pos, bins=bins, alpha=0.55, color="#d62728", label=f"True 1 (n={pos.size})", density=False)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_xlabel("Predicted Probability (IDH mutant)")
+    ax.set_ylabel("Patient Count")
+    ax.set_title(title)
+    ax.legend(loc="upper center")
+    ax.grid(axis="y", alpha=0.2, linewidth=0.5)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _extract_concept_ids(patient_concept_rows: Sequence[Mapping[str, object]]) -> List[str]:
+    if not patient_concept_rows:
+        return []
+    matched: List[Tuple[int, str]] = []
+    for key in patient_concept_rows[0].keys():
+        m = re.fullmatch(r"c(\d+)_abs_error_std", str(key))
+        if m is None:
+            continue
+        matched.append((int(m.group(1)), f"c{int(m.group(1))}"))
+    matched.sort(key=lambda item: item[0])
+    return [item[1] for item in matched]
+
+
+def _plot_concept_abs_error_boxplot(
+    patient_concept_rows: Sequence[Mapping[str, object]],
+    path: Path,
+    title: str,
+    dpi: int,
+) -> bool:
+    concept_ids = _extract_concept_ids(patient_concept_rows)
+    if not concept_ids:
+        return False
+    data: List[np.ndarray] = []
+    for concept_id in concept_ids:
+        data.append(
+            np.asarray(
+                [float(row[f"{concept_id}_abs_error_std"]) for row in patient_concept_rows],
+                dtype=np.float64,
+            )
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8.0, 4.8), dpi=dpi)
+    ax.boxplot(data, labels=concept_ids, showmeans=True)
+    ax.set_xlabel("Concept")
+    ax.set_ylabel("Absolute Error (std scale)")
+    ax.set_title(title)
+    ax.grid(axis="y", alpha=0.2, linewidth=0.5)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _plot_concept_mae_ranking(
+    patient_concept_rows: Sequence[Mapping[str, object]],
+    path: Path,
+    title: str,
+    dpi: int,
+) -> bool:
+    concept_ids = _extract_concept_ids(patient_concept_rows)
+    if not concept_ids:
+        return False
+
+    rows: List[Tuple[str, float]] = []
+    for concept_id in concept_ids:
+        mae = float(
+            np.mean([float(row[f"{concept_id}_abs_error_std"]) for row in patient_concept_rows], dtype=np.float64)
+        )
+        rows.append((concept_id, mae))
+    rows.sort(key=lambda item: item[1], reverse=True)
+
+    labels = [item[0] for item in rows]
+    values = [item[1] for item in rows]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8.0, 4.8), dpi=dpi)
+    bars = ax.bar(labels, values, color="#ff7f0e", alpha=0.85)
+    for bar, value in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2.0, value, f"{value:.3f}", ha="center", va="bottom", fontsize=9)
+    ax.set_xlabel("Concept")
+    ax.set_ylabel("MAE (std scale)")
+    ax.set_title(title)
+    ax.grid(axis="y", alpha=0.2, linewidth=0.5)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _plot_concept_true_vs_pred_grid(
+    patient_concept_rows: Sequence[Mapping[str, object]],
+    path: Path,
+    title: str,
+    dpi: int,
+) -> bool:
+    concept_ids = _extract_concept_ids(patient_concept_rows)
+    if not concept_ids:
+        return False
+
+    n_concepts = len(concept_ids)
+    cols = min(4, n_concepts)
+    rows = int(math.ceil(n_concepts / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(4.2 * cols, 3.6 * rows), dpi=dpi)
+    if rows == 1 and cols == 1:
+        axes_list = [axes]
+    elif rows == 1:
+        axes_list = list(axes)
+    elif cols == 1:
+        axes_list = list(axes)
+    else:
+        axes_list = [ax for row_axes in axes for ax in row_axes]
+
+    for idx, concept_id in enumerate(concept_ids):
+        ax = axes_list[idx]
+        x_true = np.asarray([float(row[f"{concept_id}_true_std"]) for row in patient_concept_rows], dtype=np.float64)
+        y_pred = np.asarray([float(row[f"{concept_id}_pred_std"]) for row in patient_concept_rows], dtype=np.float64)
+        ax.scatter(x_true, y_pred, s=18, alpha=0.75, color="#1f77b4")
+        lim_min = float(min(float(np.min(x_true)), float(np.min(y_pred))))
+        lim_max = float(max(float(np.max(x_true)), float(np.max(y_pred))))
+        if lim_min == lim_max:
+            lim_min -= 1.0
+            lim_max += 1.0
+        ax.plot([lim_min, lim_max], [lim_min, lim_max], linestyle="--", color="#999999", linewidth=1.0)
+        ax.set_title(concept_id)
+        ax.set_xlabel("True (std)")
+        ax.set_ylabel("Pred (std)")
+        ax.grid(alpha=0.2, linewidth=0.5)
+
+    for idx in range(n_concepts, len(axes_list)):
+        axes_list[idx].axis("off")
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def export_evaluation_figures(
+    split_prediction_rows: Mapping[str, Sequence[Mapping[str, object]]],
+    split_concept_rows: Mapping[str, Sequence[Mapping[str, object]]],
+    output_dir: Path,
+    run_id: str,
+    include_splits: Sequence[str],
+    dpi: int,
+) -> Dict[str, Dict[str, str]]:
+    if not HAS_MATPLOTLIB:
+        return {}
+
+    figure_dir = output_dir / "figures"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    records: Dict[str, Dict[str, str]] = {}
+
+    for split in include_splits:
+        pred_rows = list(split_prediction_rows.get(split, []))
+        if not pred_rows:
+            continue
+        concept_rows = list(split_concept_rows.get(split, []))
+        split_records: Dict[str, str] = {}
+
+        roc_path = figure_dir / f"roc_curve_{MODEL_NAME}_{split}_{run_id}.png"
+        if _plot_roc_curve(pred_rows, roc_path, f"{MODEL_NAME.upper()} ROC ({split})", dpi=dpi):
+            split_records["roc_curve"] = str(roc_path)
+
+        pr_path = figure_dir / f"pr_curve_{MODEL_NAME}_{split}_{run_id}.png"
+        if _plot_pr_curve(pred_rows, pr_path, f"{MODEL_NAME.upper()} PR ({split})", dpi=dpi):
+            split_records["pr_curve"] = str(pr_path)
+
+        cm_path = figure_dir / f"confusion_matrix_{MODEL_NAME}_{split}_{run_id}.png"
+        _plot_confusion_matrix(pred_rows, cm_path, f"{MODEL_NAME.upper()} Confusion Matrix ({split})", dpi=dpi)
+        split_records["confusion_matrix"] = str(cm_path)
+
+        cal_path = figure_dir / f"calibration_curve_{MODEL_NAME}_{split}_{run_id}.png"
+        if _plot_calibration_curve(pred_rows, cal_path, f"{MODEL_NAME.upper()} Calibration ({split})", dpi=dpi):
+            split_records["calibration_curve"] = str(cal_path)
+
+        prob_hist_path = figure_dir / f"probability_distribution_{MODEL_NAME}_{split}_{run_id}.png"
+        if _plot_probability_distribution(
+            pred_rows,
+            prob_hist_path,
+            f"{MODEL_NAME.upper()} Probability Distribution ({split})",
+            dpi=dpi,
+        ):
+            split_records["probability_distribution"] = str(prob_hist_path)
+
+        if concept_rows:
+            concept_box_path = figure_dir / f"concept_abs_error_boxplot_{MODEL_NAME}_{split}_{run_id}.png"
+            if _plot_concept_abs_error_boxplot(
+                concept_rows,
+                concept_box_path,
+                f"{MODEL_NAME.upper()} Concept Abs Error Boxplot ({split})",
+                dpi=dpi,
+            ):
+                split_records["concept_abs_error_boxplot"] = str(concept_box_path)
+
+            concept_rank_path = figure_dir / f"concept_mae_ranking_{MODEL_NAME}_{split}_{run_id}.png"
+            if _plot_concept_mae_ranking(
+                concept_rows,
+                concept_rank_path,
+                f"{MODEL_NAME.upper()} Concept MAE Ranking ({split})",
+                dpi=dpi,
+            ):
+                split_records["concept_mae_ranking"] = str(concept_rank_path)
+
+            concept_scatter_path = figure_dir / f"concept_true_vs_pred_{MODEL_NAME}_{split}_{run_id}.png"
+            if _plot_concept_true_vs_pred_grid(
+                concept_rows,
+                concept_scatter_path,
+                f"{MODEL_NAME.upper()} Concept True vs Pred ({split})",
+                dpi=dpi,
+            ):
+                split_records["concept_true_vs_pred"] = str(concept_scatter_path)
+
+        if split_records:
+            records[split] = split_records
+
+    return records
+
+
 def export_evaluation_outputs(
     split_outputs: Mapping[str, Mapping[str, object]],
     output_dir: Path,
@@ -454,6 +849,9 @@ def export_evaluation_outputs(
     checkpoint_name: str,
     threshold: float,
     config_path: str,
+    export_png: bool = False,
+    figure_include_splits: Optional[Sequence[str]] = None,
+    figure_dpi: int = 150,
 ) -> Dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -463,6 +861,8 @@ def export_evaluation_outputs(
     roc_rows: List[Dict[str, object]] = []
     cm_rows: List[Dict[str, object]] = []
     wrong_rows: List[Dict[str, object]] = []
+    split_prediction_rows: Dict[str, List[Dict[str, object]]] = {}
+    split_concept_rows: Dict[str, List[Dict[str, object]]] = {}
 
     for split in ("train", "val", "test"):
         if split not in split_outputs:
@@ -471,6 +871,8 @@ def export_evaluation_outputs(
         pred_rows = list(output["patient_prediction_rows"])
         concept_rows = list(output["patient_concept_rows"])
         metrics = dict(output["metrics"])
+        split_prediction_rows[split] = pred_rows
+        split_concept_rows[split] = concept_rows
 
         patient_pred_rows.extend(pred_rows)
         patient_concept_rows.extend(concept_rows)
@@ -612,6 +1014,18 @@ def export_evaluation_outputs(
         wrong_rows,
     )
 
+    figure_records: Dict[str, Dict[str, str]] = {}
+    if export_png:
+        include = tuple(figure_include_splits or tuple(split_prediction_rows.keys()))
+        figure_records = export_evaluation_figures(
+            split_prediction_rows=split_prediction_rows,
+            split_concept_rows=split_concept_rows,
+            output_dir=output_dir,
+            run_id=run_id,
+            include_splits=include,
+            dpi=figure_dpi,
+        )
+
     summary = {
         "model": MODEL_NAME,
         "run_id": run_id,
@@ -627,11 +1041,12 @@ def export_evaluation_outputs(
             "roc_points": str(roc_path),
             "confusion_matrix": str(cm_path),
             "wrong_cases": str(wrong_path),
+            "figures": figure_records,
         },
     }
     _save_json(summary_path, summary)
 
-    return {
+    exported: Dict[str, Path] = {
         "patient_predictions": pred_path,
         "patient_concepts": concept_path,
         "metrics": metrics_path,
@@ -640,6 +1055,9 @@ def export_evaluation_outputs(
         "wrong_cases": wrong_path,
         "run_summary": summary_path,
     }
+    if export_png and HAS_MATPLOTLIB:
+        exported["figures"] = output_dir / "figures"
+    return exported
 
 
 def build_eval_datasets_and_loaders(
@@ -697,6 +1115,9 @@ def run_full_evaluation(
     device: torch.device,
     include_splits: Sequence[str],
     config_path: str,
+    export_png: bool = False,
+    figure_include_splits: Optional[Sequence[str]] = None,
+    figure_dpi: int = 150,
 ) -> Dict[str, Path]:
     split_outputs: Dict[str, Dict[str, object]] = {}
     for split in include_splits:
@@ -721,6 +1142,9 @@ def run_full_evaluation(
         checkpoint_name=checkpoint_name,
         threshold=threshold,
         config_path=config_path,
+        export_png=export_png,
+        figure_include_splits=figure_include_splits,
+        figure_dpi=figure_dpi,
     )
 
 
@@ -805,12 +1229,17 @@ def main() -> None:
 
     threshold = float(args.threshold) if args.threshold is not None else float(eval_cfg.get("threshold", 0.5))
     topk_pool = int(args.topk_pool) if args.topk_pool is not None else int(eval_cfg.get("topk_pool", 0))
+    export_png = bool(eval_cfg.get("export_png", False))
+    figure_dpi = int(eval_cfg.get("figure_dpi", 150))
     batch_size = int(args.batch_size) if args.batch_size is not None else int(train_cfg.get("batch_size", 8))
     num_workers = int(args.num_workers) if args.num_workers is not None else int(train_cfg.get("num_workers", 4))
 
     include_splits = [item.strip() for item in args.splits.split(",") if item.strip()]
     if not include_splits:
         raise ValueError("No splits specified for evaluation.")
+    figure_include_splits = tuple(eval_cfg.get("figure_include_splits", include_splits))
+    if not figure_include_splits:
+        figure_include_splits = tuple(include_splits)
 
     device = torch.device(args.device)
     scaler = load_concept_scaler(concept_scaler_json)
@@ -838,6 +1267,9 @@ def main() -> None:
         device=device,
         include_splits=include_splits,
         config_path=str(args.config),
+        export_png=export_png,
+        figure_include_splits=figure_include_splits,
+        figure_dpi=figure_dpi,
     )
 
     print("Evaluation completed. Exported files:")

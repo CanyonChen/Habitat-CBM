@@ -58,7 +58,7 @@
     "_comment_label_hidden_dim": "label_head 的隐藏层维度，即 8 维概念到 1 维 IDH logit 之间的中间维度。",
     "label_hidden_dim": 32,
     "_comment_dropout_p": "concept_head 和 label_head 中 Dropout 的概率，用于缓解小样本过拟合。范围应为 [0,1)。",
-    "dropout_p": 0.7,
+    "dropout_p": 0.4,
     "_comment_pretrained": "是否使用 ResNet18 预训练权重初始化 encoder。具体行为取决于 models/resnet_18.py 的实现。",
     "pretrained": true
   },
@@ -73,9 +73,11 @@
     "_comment_num_workers": "DataLoader 子进程数量。过大可能占用较多 CPU/内存；调试时可设为 0。",
     "num_workers": 4,
     "_comment_early_stop_patience": "早停耐心值。连续多少个 epoch 没有超过 early_stop_min_delta 的改进后停止当前 stage；小于等于 0 表示不早停。",
-    "early_stop_patience": 10,
+    "early_stop_patience": 20,
     "_comment_early_stop_min_delta": "判断指标改进所需的最小提升。Stage1 监控 -val_concept_loss，Stage2/3 优先监控 val_auc。",
-    "early_stop_min_delta": 0.0,
+    "early_stop_min_delta": 0.002,
+    "_comment_patient_balanced_sampling": "是否对 train split 启用患者均衡 + 类别均衡 block 采样。开启后每个患者在一个 epoch 内的期望权重更接近。",
+    "patient_balanced_sampling": true,
     "_comment_use_monai_augmentation": "是否对 train split 启用 MONAI 随机增强。val/test 只做 resize 和类型转换，不做随机增强。",
     "use_monai_augmentation": true,
     "_comment_aug_affine_prob": "随机仿射增强概率，包括旋转、平移、缩放。",
@@ -114,7 +116,16 @@
       "_comment_checkpoint_name": "Stage1 最优权重文件名，保存到 checkpoint_root 下。",
       "checkpoint_name": "stage1_best.pt",
       "_comment_log_csv": "Stage1 训练日志文件名，保存到 runs_root/run_id 下。",
-      "log_csv": "stage1_concept_log.csv"
+      "log_csv": "stage1_concept_log.csv",
+      "_comment_scheduler": "Stage1 单独调度器覆盖：更快降 lr，降低概念 loss 震荡。",
+      "scheduler": {
+        "enabled": true,
+        "name": "reduce_on_plateau",
+        "mode": "max",
+        "factor": 0.3,
+        "patience": 3,
+        "min_lr": 1e-06
+      }
     },
     "stage2": {
       "_comment": "Stage2: 冻结 encoder 和 concept_head，只训练 label_head；输入真实标准化概念 concept_true_std，学习 C->Y 的 oracle 分类映射。",
@@ -123,7 +134,11 @@
       "_comment_checkpoint_name": "Stage2 最优权重文件名，保存到 checkpoint_root 下。",
       "checkpoint_name": "stage2_best.pt",
       "_comment_log_csv": "Stage2 训练日志文件名，保存到 runs_root/run_id 下。",
-      "log_csv": "stage2_label_head_log.csv"
+      "log_csv": "stage2_label_head_log.csv",
+      "_comment_patient_level": "是否将 Stage2 改为患者级样本（每位患者只出现一次概念向量）。",
+      "patient_level": true,
+      "_comment_concept_noise_std": "Stage2 训练期对 concept_true_std 注入高斯噪声的标准差；验证期不注入噪声。",
+      "concept_noise_std": 0.15
     },
     "stage3": {
       "_comment": "Stage3: 解冻全部模块，完整训练 X->C->Y；总 loss = lambda_c * concept_loss + lambda_y * label_loss。",
@@ -132,7 +147,22 @@
       "_comment_checkpoint_name": "Stage3 最优权重文件名，保存到 checkpoint_root 下；训练结束后自动用它做正式评估。",
       "checkpoint_name": "stage3_best.pt",
       "_comment_log_csv": "Stage3 训练日志文件名，保存到 runs_root/run_id 下。",
-      "log_csv": "stage3_joint_log.csv"
+      "log_csv": "stage3_joint_log.csv",
+      "_comment_optimizer": "Stage3 单独优化器覆盖：小学习率联合微调，避免从 Stage2 最优点大幅偏移。",
+      "optimizer": {
+        "name": "adamw",
+        "lr": 0.00001,
+        "lr_encoder": 0.000005,
+        "lr_concept_head": 0.00001,
+        "lr_label_head": 0.00001,
+        "weight_decay": 0.01,
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "eps": 1e-08,
+        "amsgrad": false
+      }
     },
     "_comment_stage_override": "如需单独给某个 stage 设置优化器或调度器，可在 stage1/stage2/stage3 内加入 optimizer 或 scheduler 子对象，它会覆盖全局 optimizer/scheduler 的同名字段。"
   },
@@ -141,9 +171,11 @@
     "concept": {
       "_comment": "概念回归 loss。当前支持 mse、l1/mae、smooth_l1/huber。训练目标是标准化概念 concept_true_std。",
       "_comment_name": "概念 loss 名称。mse 是默认选择，适合连续概念回归。",
-      "name": "mse",
+      "name": "smooth_l1",
       "_comment_reduction": "loss 聚合方式。常用 mean；也可用 sum 或 none，但训练通常使用 mean。",
-      "reduction": "mean"
+      "reduction": "mean",
+      "_comment_beta": "SmoothL1 的转折点参数 beta，越小越接近 MAE。",
+      "beta": 0.5
     },
     "label": {
       "_comment": "IDH 二分类 loss。当前支持 bce_with_logits 和 focal_bce_with_logits。输入是 y_logit，内部做 sigmoid 形式的 BCE。",
@@ -153,15 +185,17 @@
       "reduction": "mean",
       "_comment_use_pos_weight": "是否在 BCE/focal BCE 中使用训练集患者级 pos_weight = N_negative / N_positive，用于缓解类别不平衡。",
       "use_pos_weight": true,
+      "_comment_manual_pos_weight": "手动覆盖 pos_weight。设为正数时优先于自动统计值；与 use_pos_weight=true 配合生效。",
+      "manual_pos_weight": 2.5,
       "_comment_label_smoothing": "二分类标签平滑强度。0 表示不平滑；大于 0 时会把 0/1 标签向 0.5 轻微移动。",
       "label_smoothing": 0.0
     },
     "joint": {
       "_comment": "Stage3 联合 loss 权重。总 loss = lambda_c * concept_loss + lambda_y * label_loss。",
       "_comment_lambda_c": "概念回归 loss 权重。越大越强调概念可解释性和概念预测准确性。",
-      "lambda_c": 1.0,
+      "lambda_c": 0.5,
       "_comment_lambda_y": "IDH 分类 loss 权重。越大越强调最终分类性能。",
-      "lambda_y": 0.5
+      "lambda_y": 1.0
     }
   },
   "optimizer": {
@@ -209,7 +243,7 @@
   "eval": {
     "_comment": "训练完成后的正式评估配置，同时也用于训练期间 val AUC 的患者级聚合口径。",
     "_comment_threshold": "二分类阈值。患者级概率 >= threshold 判为 IDH mutant。",
-    "threshold": 0.5,
+    "threshold": 0.4,
     "_comment_topk_pool": "患者级概率聚合时是否只选 top-k block。0 表示使用该患者所有 block 的平均概率；大于 0 时按当前代码的 abs(prob-0.5) 降序选更自信的 top-k block。",
     "topk_pool": 0,
     "_comment_include_splits": "训练结束后自动评估并导出的 split 列表。通常保留 train/val/test 便于检查过拟合。",
@@ -217,7 +251,17 @@
       "train",
       "val",
       "test"
-    ]
+    ],
+    "_comment_export_png": "是否在 CSV/JSON 指标外额外导出 PNG 图集（ROC、PR、混淆矩阵、校准、概率分布、概念误差等）。",
+    "export_png": true,
+    "_comment_figure_include_splits": "PNG 图集导出的 split 列表，默认 train/val/test。",
+    "figure_include_splits": [
+      "train",
+      "val",
+      "test"
+    ],
+    "_comment_figure_dpi": "PNG 图像分辨率（dpi）。",
+    "figure_dpi": 150
   },
   "intervention": {
     "_comment": "概念干预相关配置。当前训练脚本不会自动运行干预；这些参数主要给 intervene_habitat_cbm.py 或后续自动化流程使用。",

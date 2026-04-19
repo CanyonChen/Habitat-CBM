@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam, AdamW, Optimizer, RMSprop, SGD
+from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import (
     CosineAnnealingLR,
     CosineAnnealingWarmRestarts,
@@ -46,6 +47,7 @@ from models.habitat_CBM import HabitatCBM
 from srcs.data_loader_habitat_CBM import (
     ConceptScaler,
     HabitatIDHBlockDataset,
+    PatientConceptDataset,
     build_habitat_cbm_dataloaders,
     build_habitat_cbm_datasets,
     load_concept_scaler,
@@ -570,7 +572,22 @@ def _compute_input_channels(data_cfg: Mapping[str, object]) -> int:
     return len(modalities) * block_depth + (block_depth if append_voi_mask else 0)
 
 
-def _compute_pos_weight_from_train_patients(dataset: HabitatIDHBlockDataset, device: torch.device) -> torch.Tensor:
+def _compute_pos_weight_from_train_patients(
+    dataset: HabitatIDHBlockDataset,
+    device: torch.device,
+    label_loss_config: Mapping[str, object],
+) -> Optional[torch.Tensor]:
+    use_pos_weight = bool(label_loss_config.get("use_pos_weight", True))
+    if not use_pos_weight:
+        return None
+
+    manual_value = label_loss_config.get("manual_pos_weight", None)
+    if manual_value is not None:
+        value = float(manual_value)
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"manual_pos_weight must be a positive finite float, got {manual_value}")
+        return torch.tensor([value], dtype=torch.float32, device=device)
+
     positive = 0
     negative = 0
     for case in dataset.patient_cases.values():
@@ -587,6 +604,29 @@ def _compute_pos_weight_from_train_patients(dataset: HabitatIDHBlockDataset, dev
     # BCEWithLogits pos_weight = N_negative / N_positive
     value = float(negative / positive)
     return torch.tensor([value], dtype=torch.float32, device=device)
+
+
+def _build_stage2_patient_dataloaders(
+    datasets: Mapping[str, HabitatIDHBlockDataset],
+    batch_size: int,
+    num_workers: int,
+) -> Dict[str, DataLoader]:
+    return {
+        "train": DataLoader(
+            PatientConceptDataset(datasets["train"]),
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        ),
+        "val": DataLoader(
+            PatientConceptDataset(datasets["val"]),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        ),
+    }
 
 
 def _safe_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
@@ -917,7 +957,8 @@ def _train_stage2_epoch(
     dataloader,
     optimizer: Optimizer,
     device: torch.device,
-    pos_weight: torch.Tensor,
+    pos_weight: Optional[torch.Tensor],
+    concept_noise_std: float,
     label_loss_config: Mapping[str, object],
 ) -> Dict[str, float]:
     model.train()
@@ -929,7 +970,11 @@ def _train_stage2_epoch(
         y_true = batch["label"].to(device=device, dtype=torch.float32, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        y_logit = model.forward_c_to_y(c_true_std)
+        if concept_noise_std > 0.0:
+            c_input = c_true_std + torch.randn_like(c_true_std) * float(concept_noise_std)
+        else:
+            c_input = c_true_std
+        y_logit = model.forward_c_to_y(c_input)
         loss = compute_label_loss(
             y_logit=y_logit,
             y_true=y_true,
@@ -950,7 +995,7 @@ def _eval_stage2_epoch(
     model: HabitatCBM,
     dataloader,
     device: torch.device,
-    pos_weight: torch.Tensor,
+    pos_weight: Optional[torch.Tensor],
     topk_pool: int,
     threshold: float,
     label_loss_config: Mapping[str, object],
@@ -1011,7 +1056,7 @@ def _train_stage3_epoch(
     device: torch.device,
     lambda_c: float,
     lambda_y: float,
-    pos_weight: torch.Tensor,
+    pos_weight: Optional[torch.Tensor],
     concept_loss_config: Mapping[str, object],
     label_loss_config: Mapping[str, object],
 ) -> Dict[str, float]:
@@ -1062,7 +1107,7 @@ def _eval_stage3_epoch(
     device: torch.device,
     lambda_c: float,
     lambda_y: float,
-    pos_weight: torch.Tensor,
+    pos_weight: Optional[torch.Tensor],
     topk_pool: int,
     threshold: float,
     concept_loss_config: Mapping[str, object],
@@ -1159,7 +1204,8 @@ def _train_stage_loop(
     threshold: float,
     lambda_c: float,
     lambda_y: float,
-    pos_weight: torch.Tensor,
+    pos_weight: Optional[torch.Tensor],
+    concept_noise_std: float,
 ) -> Tuple[int, float, List[Dict[str, object]]]:
     best_epoch = -1
     best_score = -float("inf")
@@ -1190,6 +1236,7 @@ def _train_stage_loop(
                 optimizer,
                 device,
                 pos_weight,
+                concept_noise_std=concept_noise_std,
                 label_loss_config=label_loss_config,
             )
             val_stats = _eval_stage2_epoch(
@@ -1383,6 +1430,12 @@ def main() -> None:
         batch_size=int(train_cfg.get("batch_size", 8)),
         num_workers=int(train_cfg.get("num_workers", 4)),
         train_shuffle=True,
+        patient_balanced_sampling=bool(train_cfg.get("patient_balanced_sampling", False)),
+    )
+    stage2_patient_dataloaders = _build_stage2_patient_dataloaders(
+        datasets=datasets,
+        batch_size=int(train_cfg.get("batch_size", 8)),
+        num_workers=int(train_cfg.get("num_workers", 4)),
     )
 
     scaler: ConceptScaler = load_concept_scaler(concept_scaler_json)
@@ -1397,7 +1450,11 @@ def main() -> None:
         pretrained=bool(model_cfg.get("pretrained", True)),
     ).to(device)
 
-    pos_weight = _compute_pos_weight_from_train_patients(datasets["train"], device=device)
+    pos_weight = _compute_pos_weight_from_train_patients(
+        datasets["train"],
+        device=device,
+        label_loss_config=label_loss_cfg,
+    )
 
     # 固定监控口径
     threshold = float(eval_cfg.get("threshold", 0.5))
@@ -1417,6 +1474,18 @@ def main() -> None:
 
     for stage_name, epochs, ckpt_path, log_path, stage_cfg in stage_cfgs:
         stage = set_train_stage(model, stage_name)
+        stage2_patient_level = bool(stage_cfg.get("patient_level", False))
+        stage2_concept_noise_std = float(stage_cfg.get("concept_noise_std", 0.0))
+        if stage2_concept_noise_std < 0.0:
+            raise ValueError(f"stages.{stage}.concept_noise_std must be >= 0, got {stage2_concept_noise_std}")
+
+        if stage == "stage2" and stage2_patient_level:
+            stage_train_loader = stage2_patient_dataloaders["train"]
+            stage_val_loader = stage2_patient_dataloaders["val"]
+        else:
+            stage_train_loader = dataloaders["train"]
+            stage_val_loader = dataloaders["val"]
+
         stage_optimizer_cfg = {
             **optimizer_cfg,
             **_as_mapping(stage_cfg.get("optimizer", {}), name=f"stages.{stage}.optimizer"),
@@ -1439,8 +1508,8 @@ def main() -> None:
         best_epoch, best_score, _ = _train_stage_loop(
             stage=stage,
             model=model,
-            train_loader=dataloaders["train"],
-            val_loader=dataloaders["val"],
+            train_loader=stage_train_loader,
+            val_loader=stage_val_loader,
             optimizer=optimizer,
             scheduler=scheduler,
             scheduler_step_mode=scheduler_step_mode,
@@ -1469,6 +1538,7 @@ def main() -> None:
             lambda_c=lambda_c,
             lambda_y=lambda_y,
             pos_weight=pos_weight,
+            concept_noise_std=stage2_concept_noise_std,
         )
 
         # 下一阶段从当前阶段最佳权重继续
@@ -1482,6 +1552,8 @@ def main() -> None:
             "optimizer": dict(stage_optimizer_cfg),
             "scheduler": dict(stage_scheduler_cfg),
             "scheduler_step_mode": scheduler_step_mode,
+            "stage2_patient_level": stage2_patient_level if stage == "stage2" else False,
+            "stage2_concept_noise_std": stage2_concept_noise_std if stage == "stage2" else 0.0,
         }
         stage_checkpoint_paths[stage] = ckpt_path
 
@@ -1489,6 +1561,7 @@ def main() -> None:
     _load_checkpoint_model_only(model, stage3_ckpt, device=device)
 
     include_splits = tuple(eval_cfg.get("include_splits", ["train", "val", "test"]))
+    figure_include_splits = tuple(eval_cfg.get("figure_include_splits", include_splits))
     exported = run_full_evaluation(
         model=model,
         dataloaders=dataloaders,
@@ -1501,6 +1574,9 @@ def main() -> None:
         device=device,
         include_splits=include_splits,
         config_path=str(args.config),
+        export_png=bool(eval_cfg.get("export_png", False)),
+        figure_include_splits=figure_include_splits,
+        figure_dpi=int(eval_cfg.get("figure_dpi", 150)),
     )
 
     run_summary = {
@@ -1525,7 +1601,7 @@ def main() -> None:
             "test_patients": len(datasets["test"].patient_cases),
         },
         "class_balance": {
-            "pos_weight": float(pos_weight.item()),
+            "pos_weight": float(pos_weight.item()) if pos_weight is not None else None,
         },
         "loss": effective_loss_cfg,
         "optimizer": dict(optimizer_cfg),

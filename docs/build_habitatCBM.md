@@ -101,8 +101,11 @@ python habitat_CBM/repo/srcs/train_habitat_CBM.py \
 
 说明：
 
-1. Stage2/3 自动启用患者级类别不平衡 `pos_weight`。
-2. 训练结束自动执行患者级评估导出。
+1. Stage2/3 自动启用类别不平衡 `pos_weight`，并支持 `loss.label.manual_pos_weight` 手动覆盖。
+2. `train.patient_balanced_sampling=true` 时，Stage1/3 训练集会启用患者均衡 + 类别均衡的 block 采样。
+3. `stages.stage2.patient_level=true` 时，Stage2 改为患者级概念训练（每位患者一条样本）。
+4. `stages.stage2.concept_noise_std>0` 时，Stage2 训练期对概念输入注入高斯噪声，验证期不加噪。
+5. 训练结束自动执行患者级评估导出，并可按配置自动生成 PNG 图集。
 
 ---
 
@@ -129,6 +132,15 @@ python habitat_CBM/repo/srcs/eval_habitat_CBM.py \
 5. `confusion_matrix_habitat_cbm_<run_id>.csv`
 6. `wrong_cases_habitat_cbm_<run_id>.csv`
 7. `run_summary_habitat_cbm_<run_id>.json`
+8. `figures/*.png`（当 `eval.export_png=true`）：
+   - `roc_curve_*`
+   - `pr_curve_*`
+   - `confusion_matrix_*`
+   - `calibration_curve_*`
+   - `probability_distribution_*`
+   - `concept_abs_error_boxplot_*`
+   - `concept_mae_ranking_*`
+   - `concept_true_vs_pred_*`
 
 ---
 
@@ -184,8 +196,9 @@ python habitat_CBM/repo/srcs/intervene_habitat_cbm.py \
 当前实现已与 `lab_timeline.md` / `paper.md` 所需主产物对齐：
 
 1. 患者级主任务：`metrics_*` / `roc_points_*` / `confusion_matrix_*`
-2. 概念层：`patient_concepts_*` + `concept_metrics_*`
-3. 干预层：`intervention_*`
+2. 图像可视化：`figures/*.png`（ROC/PR/CM/Calibration/概率分布/概念误差图）
+3. 概念层：`patient_concepts_*` + `concept_metrics_*`
+4. 干预层：`intervention_*`
 
 ---
 

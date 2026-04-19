@@ -14,13 +14,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 import sys
 
@@ -322,6 +323,62 @@ class HabitatIDHBlockDataset(_BaseHabitatIDHBlockDataset):
         return output
 
 
+class PatientConceptDataset(Dataset):
+    """患者级 Stage2 数据集：每位患者仅保留一条概念样本。"""
+
+    def __init__(self, block_dataset: HabitatIDHBlockDataset) -> None:
+        if not block_dataset.enable_concepts:
+            raise ValueError("PatientConceptDataset requires concept-enabled block dataset.")
+        self.block_dataset = block_dataset
+        self.patient_ids = sorted(block_dataset.patient_cases.keys())
+
+    def __len__(self) -> int:
+        return len(self.patient_ids)
+
+    def __getitem__(self, index: int) -> Dict[str, object]:
+        patient_id = self.patient_ids[index]
+        patient_case = self.block_dataset.patient_cases[patient_id]
+        concept_raw, concept_std = self.block_dataset._get_concepts(patient_id)
+        return {
+            "patient_id": patient_id,
+            "label": torch.tensor(patient_case.label_id, dtype=torch.long),
+            "concept_true_raw": torch.as_tensor(concept_raw, dtype=torch.float32),
+            "concept_true_std": torch.as_tensor(concept_std, dtype=torch.float32),
+        }
+
+
+def build_patient_balanced_sampler(dataset: HabitatIDHBlockDataset) -> WeightedRandomSampler:
+    """构建患者均衡 + 类别均衡的 block 级采样器。"""
+
+    if len(dataset.sample_index) == 0:
+        raise ValueError("Cannot build sampler for empty dataset.")
+
+    patient_block_counts = Counter(item.patient_id for item in dataset.sample_index)
+    class_patient_counts = Counter(case.label_id for case in dataset.patient_cases.values())
+    for label_id, count in class_patient_counts.items():
+        if count <= 0:
+            raise ValueError(f"Class {label_id} has no patients for balanced sampling.")
+
+    weights: List[float] = []
+    for sample in dataset.sample_index:
+        patient_id = sample.patient_id
+        label_id = int(dataset.patient_cases[patient_id].label_id)
+        patient_blocks = float(patient_block_counts[patient_id])
+        class_patients = float(class_patient_counts[label_id])
+        if patient_blocks <= 0.0 or class_patients <= 0.0:
+            raise ValueError(
+                "Invalid patient/class count when building balanced sampler: "
+                f"patient={patient_id}, label={label_id}, blocks={patient_blocks}, class_patients={class_patients}"
+            )
+        weights.append(1.0 / (patient_blocks * class_patients))
+
+    return WeightedRandomSampler(
+        weights=torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(weights),
+        replacement=True,
+    )
+
+
 def build_habitat_cbm_datasets(
     split_base_root: str | Path,
     modalities: Sequence[str] = DEFAULT_MODALITIES,
@@ -371,14 +428,20 @@ def build_habitat_cbm_dataloaders(
     batch_size: int,
     num_workers: int,
     train_shuffle: bool = True,
+    patient_balanced_sampling: bool = False,
 ) -> Dict[str, DataLoader]:
     """构建 CBM 训练/验证/测试 DataLoader。"""
+
+    train_sampler = None
+    if patient_balanced_sampling:
+        train_sampler = build_patient_balanced_sampler(datasets["train"])
 
     return {
         "train": DataLoader(
             datasets["train"],
             batch_size=batch_size,
-            shuffle=train_shuffle,
+            shuffle=False if train_sampler is not None else train_shuffle,
+            sampler=train_sampler,
             num_workers=num_workers,
             pin_memory=torch.cuda.is_available(),
         ),
