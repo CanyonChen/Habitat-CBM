@@ -3,7 +3,7 @@
   "paths": {
     "_comment": "输入、输出、checkpoint 的路径配置。建议从工程根目录执行训练命令，因此这里默认使用相对路径。",
     "_comment_split_base_root": "患者级数据划分根目录。其下必须包含 train/val/test 三个子目录，每个 split 内按现有 data_loader 协议组织 conventional/functional 与 mutant/wild_type。",
-    "split_base_root": "habitat_CBM/dataset/splited_data",
+    "split_base_root": "/root/autodl-tmp/habitat_CBM/dataset/splited_data",
     "_comment_concept_label_csv": "概念标签表路径，由 build_habitat_cbm_labels.py 生成。训练时用它按 patient_id 读取 8 维 raw 概念和 y_true。",
     "concept_label_csv": "/root/autodl-tmp/habitat_CBM/dataset/concept_label/concept_labels.csv",
     "_comment_concept_scaler_json": "概念标准化参数路径，由 build_habitat_cbm_labels.py 生成。训练时用 train split 的 mean/std 把 raw 概念变成 concept_true_std。",
@@ -69,7 +69,7 @@
     "_comment_device": "训练设备，例如 cuda、cuda:0 或 cpu。",
     "device": "cuda",
     "_comment_batch_size": "DataLoader 的 batch size。样本单位是 block，不是患者。",
-    "batch_size": 32,
+    "batch_size": 64,
     "_comment_num_workers": "DataLoader 子进程数量。过大可能占用较多 CPU/内存；调试时可设为 0。",
     "num_workers": 4,
     "_comment_early_stop_patience": "早停耐心值。连续多少个 epoch 没有超过 early_stop_min_delta 的改进后停止当前 stage；小于等于 0 表示不早停。",
