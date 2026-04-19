@@ -28,7 +28,7 @@ SOURCE_MAPPING = {
     "c1": "c1_h1_t1ce_firstorder_mean",
     "c2": "c2_h23_t1ce_firstorder_mean",
     "c3": "c3_whole_tumor_shape_sphericity",
-    "c4": "c4_whole_tumor_flair_ce_volume_ratio",
+    "c4": "c4_t2flair_voi_volume_log1p_cm3",
     "c5": "c5_h12_adc_10percentile",
     "c6": "c6_h1_cbf_95percentile",
     "c7": "c7_h1_volume_ratio",

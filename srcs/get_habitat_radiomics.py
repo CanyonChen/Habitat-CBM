@@ -1022,6 +1022,23 @@ def extract_values_in_aligned_mask(image: sitk.Image, mask: sitk.Image) -> np.nd
     return image_array[mask_array > 0]
 
 
+def count_positive_voxels(mask: sitk.Image) -> int:
+    """统计二值掩膜前景体素数。"""
+
+    return int(np.sum(np.asarray(sitk.GetArrayViewFromImage(mask) > 0, dtype=np.uint8)))
+
+
+def mask_physical_volume_cm3(mask: sitk.Image) -> float:
+    """根据掩膜前景体素数和 spacing 计算物理体积，单位 cm^3。"""
+
+    voxel_count = count_positive_voxels(mask)
+    spacing = np.asarray(mask.GetSpacing(), dtype=np.float64)
+    voxel_volume_mm3 = float(np.prod(spacing))
+    if not np.isfinite(voxel_volume_mm3) or voxel_volume_mm3 <= 0:
+        raise ValueError(f"Invalid mask spacing for physical volume: {tuple(mask.GetSpacing())}")
+    return float(voxel_count * voxel_volume_mm3 / 1000.0)
+
+
 def safe_percentile(values: np.ndarray, q: float) -> float:
     """安全计算百分位，空输入时返回 NaN。"""
 
@@ -1252,10 +1269,10 @@ def extract_patient_concept_proxies(
         h23_mask = build_union_mask(reference_mask=h2_mask, masks=[h2_mask, h3_mask])
         whole_tumor_mask = build_union_mask(reference_mask=h1_mask, masks=[h1_mask, h2_mask, h3_mask])
 
-        h1_voxels = int(np.sum(np.asarray(sitk.GetArrayViewFromImage(h1_mask) > 0, dtype=np.uint8)))
-        h2_voxels = int(np.sum(np.asarray(sitk.GetArrayViewFromImage(h2_mask) > 0, dtype=np.uint8)))
-        h3_voxels = int(np.sum(np.asarray(sitk.GetArrayViewFromImage(h3_mask) > 0, dtype=np.uint8)))
-        whole_voxels = int(np.sum(np.asarray(sitk.GetArrayViewFromImage(whole_tumor_mask) > 0, dtype=np.uint8)))
+        h1_voxels = count_positive_voxels(h1_mask)
+        h2_voxels = count_positive_voxels(h2_mask)
+        h3_voxels = count_positive_voxels(h3_mask)
+        whole_voxels = count_positive_voxels(whole_tumor_mask)
 
         feature_row["h1_volume_voxels"] = h1_voxels
         feature_row["h2_volume_voxels"] = h2_voxels
@@ -1301,30 +1318,14 @@ def extract_patient_concept_proxies(
             shape_dict.get("original_shape_Sphericity", float("nan"))
         )
 
-        ce_mask_path = discover_optional_subregion_mask(case.conventional_dir, region="ce")
-        flair_mask_path = discover_optional_subregion_mask(case.conventional_dir, region="flair")
-        if ce_mask_path is not None and flair_mask_path is not None:
-            ce_mask = ensure_positive_mask(sitk.ReadImage(str(ce_mask_path)))
-            flair_mask = ensure_positive_mask(sitk.ReadImage(str(flair_mask_path)))
-            ce_voxels = int(np.sum(np.asarray(sitk.GetArrayViewFromImage(ce_mask) > 0, dtype=np.uint8)))
-            flair_voxels = int(np.sum(np.asarray(sitk.GetArrayViewFromImage(flair_mask) > 0, dtype=np.uint8)))
-            feature_row["c4_estimation_method"] = "explicit_masks"
-            feature_row["c4_ce_mask_path"] = str(ce_mask_path)
-            feature_row["c4_flair_mask_path"] = str(flair_mask_path)
-        else:
-            ce_voxels = estimate_high_intensity_volume(image=t1ce_image, mask=whole_t1ce_mask, quantile=75.0)
-            flair_voxels = estimate_high_intensity_volume(
-                image=t2flair_image,
-                mask=whole_t2flair_mask,
-                quantile=75.0,
-            )
-            feature_row["c4_estimation_method"] = "q75_within_whole_tumor"
-            feature_row["c4_ce_mask_path"] = ""
-            feature_row["c4_flair_mask_path"] = ""
-
-        feature_row["c4_ce_volume_voxels"] = int(ce_voxels)
-        feature_row["c4_flair_volume_voxels"] = int(flair_voxels)
-        feature_row["c4_whole_tumor_flair_ce_volume_ratio"] = float(flair_voxels / max(ce_voxels, 1))
+        c4_voxels = count_positive_voxels(whole_t2flair_mask)
+        if c4_voxels <= 0:
+            raise ValueError(f"Empty T2-FLAIR VOI while computing C4 for patient {case.patient_id}.")
+        c4_volume_cm3 = mask_physical_volume_cm3(whole_t2flair_mask)
+        feature_row["c4_estimation_method"] = "t2flair_voi_physical_volume"
+        feature_row["c4_t2flair_voi_volume_voxels"] = int(c4_voxels)
+        feature_row["c4_t2flair_voi_volume_cm3"] = c4_volume_cm3
+        feature_row["c4_t2flair_voi_volume_log1p_cm3"] = float(np.log1p(c4_volume_cm3))
 
         return CaseExtractionResult(ok=True, feature_row=feature_row, qc_row=qc_row, error_row=None)
 
