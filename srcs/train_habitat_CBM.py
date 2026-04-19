@@ -275,7 +275,7 @@ def build_scheduler(
         scheduler = CosineAnnealingLR(
             optimizer,
             T_max=int(cfg.get("t_max", max(epochs, 1))),
-            eta_min=float(cfg.get("eta_min", 0.0)),
+            eta_min=float(cfg.get("eta_min", 1e-6)),
         )
         return scheduler, "epoch"
 
@@ -284,7 +284,7 @@ def build_scheduler(
             optimizer,
             T_0=int(cfg.get("t_0", max(epochs, 1))),
             T_mult=int(cfg.get("t_mult", 1)),
-            eta_min=float(cfg.get("eta_min", 0.0)),
+            eta_min=float(cfg.get("eta_min", 1e-6)),
         )
         return scheduler, "epoch"
 
@@ -322,7 +322,7 @@ def build_scheduler(
             factor=float(cfg.get("factor", 0.5)),
             patience=int(cfg.get("patience", 5)),
             threshold=float(cfg.get("threshold", 1e-4)),
-            min_lr=float(cfg.get("min_lr", 0.0)),
+            min_lr=float(cfg.get("min_lr", 1e-6)),
         )
         return scheduler, "metric"
 

@@ -265,9 +265,21 @@ def build_assets(
 def _build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build Habitat-CBM concept label assets.")
     parser.add_argument("--concept-proxy-csv", type=Path, required=True)
-    parser.add_argument("--output-label-csv", type=Path, required=True)
-    parser.add_argument("--output-stats-csv", type=Path, required=True)
-    parser.add_argument("--output-scaler-json", type=Path, required=True)
+    parser.add_argument(
+        "--output-label-csv",
+        type=Path,
+        default=Path("/root/autodl-tmp/habitat_CBM/dataset/concept_label/concept_labels.csv"),
+    )
+    parser.add_argument(
+        "--output-stats-csv",
+        type=Path,
+        default=Path("/root/autodl-tmp/habitat_CBM/dataset/concept_label/concept_statistics.csv"),
+    )
+    parser.add_argument(
+        "--output-scaler-json",
+        type=Path,
+        default=Path("/root/autodl-tmp/habitat_CBM/dataset/concept_label/concept_scaler_stats.json"),
+    )
     parser.add_argument(
         "--std-floor",
         type=float,
