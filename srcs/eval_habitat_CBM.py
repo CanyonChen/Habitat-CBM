@@ -61,6 +61,18 @@ from srcs.monai_augmentation import MonaiAugmentConfig, build_monai_block_transf
 MODEL_NAME = "habitat_cbm"
 
 
+def _resolve_model_dropouts(model_cfg: Mapping[str, object]) -> Tuple[float, float]:
+    shared_dropout = model_cfg.get("dropout_p", None)
+    if shared_dropout is not None:
+        shared = float(shared_dropout)
+        concept_dropout = float(model_cfg.get("concept_dropout_p", shared))
+        label_dropout = float(model_cfg.get("label_dropout_p", shared))
+    else:
+        concept_dropout = float(model_cfg.get("concept_dropout_p", 0.3))
+        label_dropout = float(model_cfg.get("label_dropout_p", 0.1))
+    return concept_dropout, label_dropout
+
+
 def _validate_concept_tensor(
     c: torch.Tensor,
     n_concepts: int,
@@ -1191,13 +1203,15 @@ def _load_model_from_checkpoint(checkpoint_path: Path, device: torch.device) -> 
     model_cfg = payload.get("model_config", {})
     if not isinstance(model_cfg, Mapping):
         raise ValueError("Checkpoint missing model_config.")
+    concept_dropout_p, label_dropout_p = _resolve_model_dropouts(model_cfg)
 
     model = HabitatCBM(
         in_channels=int(model_cfg["in_channels"]),
         n_concepts=int(model_cfg.get("n_concepts", 8)),
         concept_hidden_dim=int(model_cfg.get("concept_hidden_dim", 256)),
         label_hidden_dim=int(model_cfg.get("label_hidden_dim", 32)),
-        dropout_p=float(model_cfg.get("dropout_p", 0.3)),
+        concept_dropout_p=concept_dropout_p,
+        label_dropout_p=label_dropout_p,
         pretrained=False,
     ).to(device)
 

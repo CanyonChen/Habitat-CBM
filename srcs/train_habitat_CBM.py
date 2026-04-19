@@ -638,6 +638,18 @@ def _compute_input_channels(data_cfg: Mapping[str, object]) -> int:
     return len(modalities) * block_depth + (block_depth if append_voi_mask else 0)
 
 
+def _resolve_model_dropouts(model_cfg: Mapping[str, object]) -> Tuple[float, float]:
+    shared_dropout = model_cfg.get("dropout_p", None)
+    if shared_dropout is not None:
+        shared = float(shared_dropout)
+        concept_dropout = float(model_cfg.get("concept_dropout_p", shared))
+        label_dropout = float(model_cfg.get("label_dropout_p", shared))
+    else:
+        concept_dropout = float(model_cfg.get("concept_dropout_p", 0.3))
+        label_dropout = float(model_cfg.get("label_dropout_p", 0.1))
+    return concept_dropout, label_dropout
+
+
 def _compute_pos_weight_from_train_patients(
     dataset: HabitatIDHBlockDataset,
     device: torch.device,
@@ -692,6 +704,66 @@ def _build_stage2_patient_dataloaders(
             num_workers=num_workers,
             pin_memory=torch.cuda.is_available(),
         ),
+    }
+
+
+def _resolve_stage_label_loss_config(
+    base_label_loss_cfg: Mapping[str, object],
+    stage_cfg: Mapping[str, object],
+    stage: TrainStage,
+) -> Dict[str, object]:
+    stage_override = _as_mapping(stage_cfg.get("label_loss", {}), name=f"stages.{stage}.label_loss")
+    resolved = {**base_label_loss_cfg, **stage_override}
+    resolved.setdefault("name", "bce_with_logits")
+    resolved.setdefault("reduction", "mean")
+    resolved.setdefault("use_pos_weight", True)
+    return resolved
+
+
+def _extract_loader_labels(dataloader) -> Optional[np.ndarray]:
+    dataset = getattr(dataloader, "dataset", None)
+    if isinstance(dataset, PatientConceptDataset):
+        labels = [
+            int(dataset.block_dataset.patient_cases[patient_id].label_id)
+            for patient_id in dataset.patient_ids
+        ]
+        return np.asarray(labels, dtype=np.int64)
+
+    if hasattr(dataset, "sample_index") and hasattr(dataset, "patient_cases"):
+        labels = [
+            int(dataset.patient_cases[item.patient_id].label_id)
+            for item in dataset.sample_index
+        ]
+        return np.asarray(labels, dtype=np.int64)
+    return None
+
+
+def _summarize_loader_sampling(dataloader) -> Dict[str, object]:
+    sampler = getattr(dataloader, "sampler", None)
+    sampler_type = type(sampler).__name__ if sampler is not None else "None"
+    labels = _extract_loader_labels(dataloader)
+    pos_ratio = float("nan")
+    neg_ratio = float("nan")
+
+    if labels is not None and labels.size > 0:
+        weights_raw = getattr(sampler, "weights", None)
+        if weights_raw is not None:
+            weights = torch.as_tensor(weights_raw, dtype=torch.float64).detach().cpu().numpy()
+            if weights.shape[0] == labels.shape[0]:
+                weight_sum = float(weights.sum())
+                if weight_sum > 0.0:
+                    pos_ratio = float(weights[labels == 1].sum() / weight_sum)
+                    neg_ratio = float(weights[labels == 0].sum() / weight_sum)
+
+        if not np.isfinite(pos_ratio) or not np.isfinite(neg_ratio):
+            total = float(labels.size)
+            pos_ratio = float((labels == 1).sum() / total)
+            neg_ratio = float((labels == 0).sum() / total)
+
+    return {
+        "sampler_type": sampler_type,
+        "pos_ratio": pos_ratio,
+        "neg_ratio": neg_ratio,
     }
 
 
@@ -1343,6 +1415,8 @@ def _train_stage_loop(
     best_score = -float("inf")
     no_improve = 0
     history: List[Dict[str, object]] = []
+    sampling_summary = _summarize_loader_sampling(train_loader)
+    effective_pos_weight_value = float(pos_weight.item()) if pos_weight is not None else None
 
     for epoch in range(1, epochs + 1):
         if stage == "stage1":
@@ -1359,8 +1433,10 @@ def _train_stage_loop(
                 device,
                 concept_loss_config=concept_loss_config,
             )
-            monitor_name = "val_concept_loss"
-            current_score = -float(val_stats["concept_loss"])
+            monitor_metric_name = "val_concept_loss"
+            monitor_metric_raw = float(val_stats["concept_loss"])
+            selection_score = -monitor_metric_raw
+            scheduler_metric = monitor_metric_raw
         elif stage == "stage2":
             train_stats = _train_stage2_epoch(
                 model,
@@ -1380,12 +1456,16 @@ def _train_stage_loop(
                 threshold=threshold,
                 label_loss_config=label_loss_config,
             )
-            monitor_name = "val_auc"
             if np.isnan(float(val_stats["auc"])):
-                current_score = -float(val_stats["label_loss"])
-                monitor_name = "-val_label_loss(fallback)"
+                monitor_metric_name = "val_label_loss(fallback)"
+                monitor_metric_raw = float(val_stats["label_loss"])
+                selection_score = -monitor_metric_raw
+                scheduler_metric = selection_score
             else:
-                current_score = float(val_stats["auc"])
+                monitor_metric_name = "val_auc"
+                monitor_metric_raw = float(val_stats["auc"])
+                selection_score = monitor_metric_raw
+                scheduler_metric = monitor_metric_raw
         else:
             train_stats = _train_stage3_epoch(
                 model,
@@ -1410,16 +1490,20 @@ def _train_stage_loop(
                 concept_loss_config=concept_loss_config,
                 label_loss_config=label_loss_config,
             )
-            monitor_name = "val_auc"
             if np.isnan(float(val_stats["auc"])):
-                current_score = -float(val_stats["total_loss"])
-                monitor_name = "-val_total_loss(fallback)"
+                monitor_metric_name = "val_total_loss(fallback)"
+                monitor_metric_raw = float(val_stats["total_loss"])
+                selection_score = -monitor_metric_raw
+                scheduler_metric = selection_score
             else:
-                current_score = float(val_stats["auc"])
+                monitor_metric_name = "val_auc"
+                monitor_metric_raw = float(val_stats["auc"])
+                selection_score = monitor_metric_raw
+                scheduler_metric = monitor_metric_raw
 
-        improved = (current_score - best_score) > float(early_stop_min_delta)
+        improved = (selection_score - best_score) > float(early_stop_min_delta)
         if improved:
-            best_score = current_score
+            best_score = selection_score
             best_epoch = epoch
             no_improve = 0
             _save_checkpoint(
@@ -1436,7 +1520,7 @@ def _train_stage_loop(
                 optimizer_config=optimizer_config,
                 scheduler_config=scheduler_config,
                 loss_config=loss_config,
-                monitor_name=monitor_name,
+                monitor_name=monitor_metric_name,
             )
         else:
             no_improve += 1
@@ -1444,24 +1528,35 @@ def _train_stage_loop(
         row: Dict[str, object] = {
             "epoch": epoch,
             "stage": stage,
-            "monitor_name": monitor_name,
-            "monitor_score": current_score,
+            "monitor_metric_name": monitor_metric_name,
+            "monitor_metric_raw": monitor_metric_raw,
+            "selection_score": selection_score,
+            "scheduler_metric": scheduler_metric,
             "is_best": int(improved),
             "best_score_so_far": best_score,
+            "effective_pos_weight": effective_pos_weight_value,
+            "train_sampler_type": sampling_summary["sampler_type"],
+            "train_pos_sampling_ratio": sampling_summary["pos_ratio"],
+            "train_neg_sampling_ratio": sampling_summary["neg_ratio"],
         }
         row.update({f"train_{k}": float(v) for k, v in train_stats.items()})
         row.update({f"val_{k}": float(v) for k, v in val_stats.items()})
         row.update(_get_current_lrs(optimizer))
         history.append(row)
 
+        pos_weight_text = f"{effective_pos_weight_value:.4f}" if effective_pos_weight_value is not None else "disabled"
         print(
-            f"[{stage}] epoch={epoch:03d} monitor={monitor_name} score={current_score:.6f} "
-            f"best={best_score:.6f} improved={improved}"
+            f"[{stage}] epoch={epoch:03d} metric={monitor_metric_name} raw={monitor_metric_raw:.6f} "
+            f"select={selection_score:.6f} best={best_score:.6f} improved={improved} "
+            f"sampler={sampling_summary['sampler_type']} "
+            f"pos_ratio={sampling_summary['pos_ratio']:.3f} "
+            f"neg_ratio={sampling_summary['neg_ratio']:.3f} "
+            f"pos_weight={pos_weight_text}"
         )
 
         if scheduler is not None:
             if scheduler_step_mode == "metric":
-                scheduler.step(current_score)
+                scheduler.step(scheduler_metric)
             elif scheduler_step_mode == "epoch":
                 scheduler.step()
 
@@ -1510,7 +1605,7 @@ def main() -> None:
     optimizer_cfg = _as_mapping(cfg.get("optimizer", {}), name="optimizer")
     scheduler_cfg = _as_mapping(cfg.get("scheduler", {}), name="scheduler")
     concept_loss_cfg, label_loss_cfg, joint_loss_cfg = _extract_loss_configs(cfg, train_cfg)
-    effective_loss_cfg = {
+    base_loss_cfg = {
         "concept": concept_loss_cfg,
         "label": label_loss_cfg,
         "joint": joint_loss_cfg,
@@ -1572,20 +1667,22 @@ def main() -> None:
 
     scaler: ConceptScaler = load_concept_scaler(concept_scaler_json)
     in_channels = int(model_cfg.get("in_channels", _compute_input_channels(data_cfg)))
+    concept_dropout_p, label_dropout_p = _resolve_model_dropouts(model_cfg)
 
     model = HabitatCBM(
         in_channels=in_channels,
         n_concepts=int(model_cfg.get("n_concepts", len(scaler.concept_names))),
         concept_hidden_dim=int(model_cfg.get("concept_hidden_dim", 256)),
         label_hidden_dim=int(model_cfg.get("label_hidden_dim", 32)),
-        dropout_p=float(model_cfg.get("dropout_p", 0.3)),
+        concept_dropout_p=concept_dropout_p,
+        label_dropout_p=label_dropout_p,
         pretrained=bool(model_cfg.get("pretrained", True)),
     ).to(device)
 
-    pos_weight = _compute_pos_weight_from_train_patients(
+    raw_pos_weight = _compute_pos_weight_from_train_patients(
         datasets["train"],
         device=device,
-        label_loss_config=label_loss_cfg,
+        label_loss_config={"use_pos_weight": True, "manual_pos_weight": None},
     )
 
     # 固定监控口径
@@ -1603,28 +1700,41 @@ def main() -> None:
 
     stage_summary: Dict[str, Dict[str, object]] = {}
     stage_checkpoint_paths: Dict[str, Path] = {}
+    stage_loss_summary: Dict[str, Dict[str, Dict[str, object]]] = {}
 
     for stage_name, epochs, ckpt_path, log_path, stage_cfg in stage_cfgs:
         stage = set_train_stage(model, stage_name)
+        stage_freeze_layer_names: List[str] = []
 
         # Stage1：根据配置冻结 encoder 浅层，抑制小样本过拟合
         if stage == "stage1":
-            freeze_layer_names = _parse_freeze_encoder_layers(
+            stage_freeze_layer_names = _parse_freeze_encoder_layers(
                 stage_cfg.get("freeze_encoder_layers", None)
             )
-            _apply_encoder_freeze(model, freeze_layer_names, stage="stage1")
+            _apply_encoder_freeze(model, stage_freeze_layer_names, stage="stage1")
 
         # Stage3：同样支持冻结 encoder 浅层，防止联合微调时特征提取层大幅偏移
         if stage == "stage3":
-            freeze_layer_names = _parse_freeze_encoder_layers(
+            stage_freeze_layer_names = _parse_freeze_encoder_layers(
                 stage_cfg.get("freeze_encoder_layers", None)
             )
-            _apply_encoder_freeze(model, freeze_layer_names, stage="stage3")
+            _apply_encoder_freeze(model, stage_freeze_layer_names, stage="stage3")
 
         stage2_patient_level = bool(stage_cfg.get("patient_level", False))
         stage2_concept_noise_std = float(stage_cfg.get("concept_noise_std", 0.0))
         if stage2_concept_noise_std < 0.0:
             raise ValueError(f"stages.{stage}.concept_noise_std must be >= 0, got {stage2_concept_noise_std}")
+        stage_label_loss_cfg = _resolve_stage_label_loss_config(label_loss_cfg, stage_cfg, stage)
+        stage_effective_loss_cfg = {
+            "concept": dict(concept_loss_cfg),
+            "label": dict(stage_label_loss_cfg),
+            "joint": dict(joint_loss_cfg),
+        }
+        stage_effective_pos_weight = _compute_pos_weight_from_train_patients(
+            datasets["train"],
+            device=device,
+            label_loss_config=stage_label_loss_cfg,
+        )
 
         if stage == "stage2" and stage2_patient_level:
             stage_train_loader = stage2_patient_dataloaders["train"]
@@ -1672,24 +1782,26 @@ def main() -> None:
                 "n_concepts": int(model_cfg.get("n_concepts", len(scaler.concept_names))),
                 "concept_hidden_dim": int(model_cfg.get("concept_hidden_dim", 256)),
                 "label_hidden_dim": int(model_cfg.get("label_hidden_dim", 32)),
-                "dropout_p": float(model_cfg.get("dropout_p", 0.3)),
+                "concept_dropout_p": concept_dropout_p,
+                "label_dropout_p": label_dropout_p,
             },
             train_config=train_cfg,
             optimizer_config=stage_optimizer_cfg,
             scheduler_config=stage_scheduler_cfg,
-            loss_config=effective_loss_cfg,
+            loss_config=stage_effective_loss_cfg,
             concept_loss_config=concept_loss_cfg,
-            label_loss_config=label_loss_cfg,
+            label_loss_config=stage_label_loss_cfg,
             topk_pool=topk_pool,
             threshold=threshold,
             lambda_c=lambda_c,
             lambda_y=lambda_y,
-            pos_weight=pos_weight,
+            pos_weight=stage_effective_pos_weight,
             concept_noise_std=stage2_concept_noise_std,
         )
 
         # 下一阶段从当前阶段最佳权重继续
         _load_checkpoint_model_only(model, ckpt_path, device=device)
+        stage_loss_summary[stage] = stage_effective_loss_cfg
 
         stage_summary[stage] = {
             "best_epoch": int(best_epoch),
@@ -1701,7 +1813,9 @@ def main() -> None:
             "scheduler_step_mode": scheduler_step_mode,
             "stage2_patient_level": stage2_patient_level if stage == "stage2" else False,
             "stage2_concept_noise_std": stage2_concept_noise_std if stage == "stage2" else 0.0,
-            "frozen_encoder_layers": freeze_layer_names if stage in ("stage1", "stage3") else [],
+            "effective_pos_weight": float(stage_effective_pos_weight.item()) if stage_effective_pos_weight is not None else None,
+            "label_loss_config": dict(stage_label_loss_cfg),
+            "frozen_encoder_layers": stage_freeze_layer_names,
         }
         stage_checkpoint_paths[stage] = ckpt_path
 
@@ -1766,14 +1880,17 @@ def main() -> None:
             "test_patients": len(datasets["test"].patient_cases),
         },
         "class_balance": {
-            "pos_weight": float(pos_weight.item()) if pos_weight is not None else None,
+            "patient_level_pos_weight_raw": float(raw_pos_weight.item()) if raw_pos_weight is not None else None,
         },
         "threshold": {
             "fixed_threshold": threshold,
             "youden_threshold": float(youden_threshold),
             "eval_threshold_used": float(eval_threshold),
         },
-        "loss": effective_loss_cfg,
+        "loss": {
+            "base": base_loss_cfg,
+            "stage_effective": stage_loss_summary,
+        },
         "optimizer": dict(optimizer_cfg),
         "scheduler": dict(scheduler_cfg),
         "stage_summary": stage_summary,

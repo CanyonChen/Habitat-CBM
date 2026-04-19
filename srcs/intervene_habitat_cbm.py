@@ -240,13 +240,22 @@ def _load_model_from_checkpoint(
     model_cfg = payload.get("model_config", {}) if isinstance(payload, dict) else {}
     if not isinstance(model_cfg, Mapping):
         model_cfg = {}
+    shared_dropout = model_cfg.get("dropout_p", None)
+    if shared_dropout is not None:
+        shared = float(shared_dropout)
+        concept_dropout_p = float(model_cfg.get("concept_dropout_p", shared))
+        label_dropout_p = float(model_cfg.get("label_dropout_p", shared))
+    else:
+        concept_dropout_p = float(model_cfg.get("concept_dropout_p", 0.3))
+        label_dropout_p = float(model_cfg.get("label_dropout_p", 0.1))
 
     model = HabitatCBM(
         in_channels=int(model_cfg.get("in_channels", fallback_in_channels)),
         n_concepts=int(model_cfg.get("n_concepts", fallback_n_concepts)),
         concept_hidden_dim=int(model_cfg.get("concept_hidden_dim", 256)),
         label_hidden_dim=int(model_cfg.get("label_hidden_dim", 32)),
-        dropout_p=float(model_cfg.get("dropout_p", 0.3)),
+        concept_dropout_p=concept_dropout_p,
+        label_dropout_p=label_dropout_p,
         pretrained=False,
     ).to(device)
 

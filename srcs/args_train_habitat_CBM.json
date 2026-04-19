@@ -57,8 +57,10 @@
     "concept_hidden_dim": 256,
     "_comment_label_hidden_dim": "label_head 的隐藏层维度，即 8 维概念到 1 维 IDH logit 之间的中间维度。",
     "label_hidden_dim": 32,
-    "_comment_dropout_p": "concept_head 和 label_head 中 Dropout 的概率，用于缓解小样本过拟合。范围应为 [0,1)。",
-    "dropout_p": 0.4,
+    "_comment_concept_dropout_p": "concept_head 中 Dropout 的概率。概念回归端默认比标签端更强一些。",
+    "concept_dropout_p": 0.7,
+    "_comment_label_dropout_p": "label_head 中 Dropout 的概率。8 维概念输入较小，默认使用更轻的正则。",
+    "label_dropout_p": 0.4,
     "_comment_pretrained": "是否使用 ResNet18 预训练权重初始化 encoder。具体行为取决于 models/resnet_18.py 的实现。",
     "pretrained": true
   },
@@ -117,9 +119,9 @@
       "checkpoint_name": "stage1_best.pt",
       "_comment_log_csv": "Stage1 训练日志文件名，保存到 runs_root/run_id 下。",
       "log_csv": "stage1_concept_log.csv",
-      "_comment_freeze_encoder_layers": "Stage1 中需要冻结的 ResNet-18 encoder 层名列表，逗号分隔或 JSON 数组均可。可用层名：conv1、bn1、layer1、layer2、layer3、layer4。设为 null 或空列表表示不冻结任何层（全量微调）。默认冻结 conv1/bn1/layer1/layer2/layer3，只激活 layer4，可在小样本场景下显著抑制过拟合，同时允许 layer4 适配概念相关特征。",
-      "freeze_encoder_layers": ["conv1", "bn1", "layer1", "layer2", "layer3"],
-      "_comment_optimizer": "Stage1 单独优化器覆盖：初始 lr 降至 3e-5，减少 val concept loss 震荡。",
+      "_comment_freeze_encoder_layers": "Stage1 中需要冻结的 ResNet-18 encoder 层名列表，逗号分隔或 JSON 数组均可。可用层名：conv1、bn1、layer1、layer2、layer3、layer4。设为 null 或空列表表示不冻结任何层（全量微调）。默认只冻结 layer1/layer2，允许 conv1/bn1/layer3/layer4 适配 35 通道多模态输入。",
+      "freeze_encoder_layers": ["layer1", "layer2", "layer3"],
+      "_comment_optimizer": "Stage1 单独优化器覆盖：初始 lr 降至 3e-5，在放松 encoder 冻结后仍保持小步更新。",
       "optimizer": {
         "name": "adamw",
         "lr": 0.00003,
@@ -151,18 +153,22 @@
       "_comment_patient_level": "是否将 Stage2 改为患者级样本（每位患者只出现一次概念向量）。",
       "patient_level": true,
       "_comment_concept_noise_std": "Stage2 训练期对 concept_true_std 注入高斯噪声的标准差；验证期不注入噪声。",
-      "concept_noise_std": 0.15
+      "concept_noise_std": 0.1,
+      "_comment_label_loss": "Stage2 标签损失覆盖。患者级训练默认保留 pos_weight。",
+      "label_loss": {
+        "use_pos_weight": true
+      }
     },
     "stage3": {
-      "_comment": "Stage3: 联合微调 X->C->Y，冻结浅层 CNN 防止过拟合，只微调 layer4、concept_head 和 label_head；总 loss = lambda_c * concept_loss + lambda_y * label_loss。",
+      "_comment": "Stage3: 联合微调 X->C->Y，默认冻结 layer1/layer2，保留 conv1/bn1/layer3/layer4 与 concept_head、label_head 的输入适配能力；总 loss = lambda_c * concept_loss + lambda_y * label_loss。",
       "_comment_epochs": "Stage3 最大训练 epoch 数，可能因早停提前结束。",
       "epochs": 100,
       "_comment_checkpoint_name": "Stage3 最优权重文件名，保存到 checkpoint_root 下；训练结束后自动用它做正式评估。",
       "checkpoint_name": "stage3_best.pt",
       "_comment_log_csv": "Stage3 训练日志文件名，保存到 runs_root/run_id 下。",
       "log_csv": "stage3_joint_log.csv",
-      "_comment_freeze_encoder_layers": "Stage3 中需要冻结的 ResNet-18 encoder 层名列表，与 Stage1 语义相同。可用层名：conv1、bn1、layer1、layer2、layer3、layer4。设为 null 或空列表表示不冻结任何层。默认冻结 conv1/bn1/layer1/layer2/layer3，与 Stage1 保持一致，防止联合微调时浅层特征大幅偏移。",
-      "freeze_encoder_layers": ["conv1", "bn1", "layer1", "layer2", "layer3"],
+      "_comment_freeze_encoder_layers": "Stage3 中需要冻结的 ResNet-18 encoder 层名列表，与 Stage1 语义相同。可用层名：conv1、bn1、layer1、layer2、layer3、layer4。设为 null 或空列表表示不冻结任何层。默认只冻结 layer1/layer2，保留 conv1/bn1/layer3/layer4 的输入适配能力。",
+      "freeze_encoder_layers": ["layer1", "layer2", "layer3"],
       "_comment_optimizer": "Stage3 单独优化器覆盖：小学习率联合微调，避免从 Stage2 最优点大幅偏移。",
       "optimizer": {
         "name": "adamw",
@@ -186,6 +192,10 @@
         "factor": 0.5,
         "patience": 8,
         "min_lr": 1e-07
+      },
+      "_comment_label_loss": "Stage3 标签损失覆盖。联合微调时已启用患者/类别均衡采样，因此默认关闭 pos_weight，避免双重类别再平衡。",
+      "label_loss": {
+        "use_pos_weight": false
       }
     },
     "_comment_stage_override": "如需单独给某个 stage 设置优化器或调度器，可在 stage1/stage2/stage3 内加入 optimizer 或 scheduler 子对象，它会覆盖全局 optimizer/scheduler 的同名字段。"

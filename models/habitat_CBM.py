@@ -79,7 +79,9 @@ class HabitatCBM(nn.Module):
         n_concepts: int = 8,
         concept_hidden_dim: int = 256,
         label_hidden_dim: int = 32,
-        dropout_p: float = 0.3,
+        dropout_p: float | None = None,
+        concept_dropout_p: float | None = None,
+        label_dropout_p: float | None = None,
         pretrained: bool = True,
     ) -> None:
         super().__init__()
@@ -95,21 +97,40 @@ class HabitatCBM(nn.Module):
             raise ValueError(
                 f"label_hidden_dim must be positive, got {label_hidden_dim}."
             )
-        if not (0.0 <= dropout_p < 1.0):
-            raise ValueError(f"dropout_p must be in [0.0, 1.0), got {dropout_p}.")
+
+        shared_dropout = float(dropout_p) if dropout_p is not None else None
+        if shared_dropout is not None and not (0.0 <= shared_dropout < 1.0):
+            raise ValueError(
+                f"dropout_p must be in [0.0, 1.0), got {shared_dropout}."
+            )
+
+        if concept_dropout_p is None:
+            concept_dropout_p = shared_dropout if shared_dropout is not None else 0.3
+        if label_dropout_p is None:
+            label_dropout_p = shared_dropout if shared_dropout is not None else 0.1
+
+        if not (0.0 <= concept_dropout_p < 1.0):
+            raise ValueError(
+                "concept_dropout_p must be in [0.0, 1.0), "
+                f"got {concept_dropout_p}."
+            )
+        if not (0.0 <= label_dropout_p < 1.0):
+            raise ValueError(
+                f"label_dropout_p must be in [0.0, 1.0), got {label_dropout_p}."
+            )
 
         self.n_concepts = n_concepts
         self.encoder = ResNet18Backbone(in_channels=in_channels, pretrained=pretrained)
         self.concept_head = nn.Sequential(
             nn.Linear(self.encoder.out_dim, concept_hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(dropout_p),
+            nn.Dropout(concept_dropout_p),
             nn.Linear(concept_hidden_dim, n_concepts),
         )
         self.label_head = nn.Sequential(
             nn.Linear(n_concepts, label_hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(dropout_p),
+            nn.Dropout(label_dropout_p),
             nn.Linear(label_hidden_dim, 1),
         )
 
@@ -164,7 +185,8 @@ if __name__ == "__main__":
         n_concepts=8,
         concept_hidden_dim=256,
         label_hidden_dim=32,
-        dropout_p=0.3,
+        concept_dropout_p=0.3,
+        label_dropout_p=0.1,
         pretrained=False,
     )
     x = torch.randn(2, 35, 224, 224)
