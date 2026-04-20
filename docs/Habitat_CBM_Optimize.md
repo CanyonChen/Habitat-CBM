@@ -1,15 +1,17 @@
 ---
 name: habitat-cbm-optimize
-description: 诊断 Habitat-CBM 当前模型、训练、评估与概念干预实现中的问题，并给出面向论文实验闭环的优化路线。
+description: 历史版 Habitat-CBM 优化诊断与实现路线记录；当前实现请结合 user guide 与模型接口文档阅读。
 ---
 
 # Habitat-CBM 优化诊断 Skill
+
+> 更新说明（2026-04-20）：本文档保留了 Habitat-CBM 从“仅有骨架与工具函数”走向完整闭环的历史诊断过程。文中的 blocker、缺失项和部分“当前实现”表述对应的是早期阶段，不再等同于当前代码状态。当前实现请优先参考 `docs/user_guide_Habitat_CBM.md` 与 `docs/habitat_CBM_model.md`。
 
 ## Overview
 
 本文件用于给用户、维护者和 LLM/Codex 提供 Habitat-CBM 优化上下文。阅读本文件后，应能判断当前 Habitat-CBM 实现为什么还不能支撑论文主实验，以及下一步应按什么顺序补齐训练、评估、概念学习和概念干预闭环。
 
-当前结论：
+历史结论（对应 pre-integration 阶段）：
 
 1. `models/habitat_CBM.py` 的核心模型结构基本正确，已经形成 `X -> C -> Y` 的硬概念瓶颈。
 2. `srcs/train_habitat_CBM.py` 和 `srcs/eval_habitat_CBM.py` 仍主要是工具函数与随机张量自检，不是完整实验 pipeline。
@@ -17,7 +19,7 @@ description: 诊断 Habitat-CBM 当前模型、训练、评估与概念干预实
 
 本文档不替代 `build_habitatCBM.md` 和 `habitat_CBM_model.md`。它的作用是指出现状问题、优化方向和实施顺序，避免后续实现时只补局部函数而没有形成论文证据链。
 
-## Problem Overview
+## Historical Problem Overview
 
 先看这一节即可快速把握当前 Habitat-CBM 的主要问题。后续章节会逐项展开原因、影响和优化方向。
 
@@ -78,16 +80,16 @@ description: 诊断 Habitat-CBM 当前模型、训练、评估与概念干预实
 7. 运行 `k = 1, 2, 4, all` 的 concept intervention。
 8. 导出主表、主图、概念指标表、概念偏差图、intervention 结果和典型病例素材。
 
-## Current Implementation Snapshot
+## Historical Implementation Snapshot
 
 ### `models/habitat_CBM.py`
 
-当前模型结构已经接近正确：
+当时的目标结构如下；当前代码已经进一步更新为可参数化概念子集 + 单层 `Dropout -> Linear` 的 `label_head`：
 
 ```text
 z = encoder(x)                      # [B, 512]
-c_hat = concept_head(z)             # [B, 8]
-y_logit = label_head(c_hat)         # [B, 1]
+c_hat = concept_head(z)             # [B, K]
+y_logit = linear(dropout(c_hat))    # [B, 1]
 ```
 
 已有优点：
@@ -101,7 +103,7 @@ y_logit = label_head(c_hat)         # [B, 1]
 主要注意点：
 
 1. 模型只定义结构，不负责训练、评估、标准化、干预统计或结果导出。
-2. `label_head` 是非线性 MLP，因此患者级干预时需要明确采用 `label_head(mean(c_block))` 还是 `mean(label_head(c_block))`。为了贴合论文表述，推荐患者级概念均值后再进 `label_head`。
+2. 当前代码中的 `label_head` 已简化为单层线性头；在 `model.eval()` 下，患者级推理/干预统一采用“先聚合患者级概念，再调用 `forward_c_to_y`”的口径，避免训练期/评估期写法分叉。
 
 ### `srcs/train_habitat_CBM.py`
 
@@ -191,7 +193,9 @@ y_logit = label_head(c_hat)         # [B, 1]
 
 但该文件仍是原始 concept proxy 表，还没有变成 CBM 训练专用的 `concept_labels.csv` 和 train-only scaler 资产。
 
-## Blocking Problems
+## Historical Blocking Problems
+
+> 注：本节记录的是早期实现阶段的 blocker 列表，其中多项已经在当前代码中解决。保留它们的目的是追溯设计决策，而不是描述当前仓库仍然缺什么。
 
 ### P0. `train_habitat_CBM.py` 无法直接训练真实数据
 
@@ -312,7 +316,7 @@ y_logit = label_head(c_hat)         # [B, 1]
 影响：
 
 1. block-level 干预结果与论文中 patient-level intervention 口径不一致。
-2. 由于 `label_head` 是非线性 MLP，`mean(label_head(c_block))` 不等于 `label_head(mean(c_block))`。
+2. 该歧义只在非线性 `label_head` 下成立；当前代码的线性 `label_head` 已消除这一点，但仍统一采用患者级概念聚合后再前向的实现口径。
 3. 若不修正，干预表格的解释会不严谨。
 
 优化方向：

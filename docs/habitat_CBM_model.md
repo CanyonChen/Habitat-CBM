@@ -1,6 +1,6 @@
 ---
 name: habitat-cbm-model
-updated: 2026-04-18
+updated: 2026-04-20
 description: Habitat-CBM 完整训练-评估-干预接口契约（JSON 配置驱动版）。
 ---
 
@@ -26,10 +26,12 @@ description: Habitat-CBM 完整训练-评估-干预接口契约（JSON 配置驱
 结构契约：
 
 ```text
-z = encoder(x)               # [B, 512]
-c_hat = concept_head(z)      # [B, 8]
-y_logit = label_head(c_hat)  # [B, 1]
+z = encoder(x)                           # [B, 512]
+c_hat = concept_head(z)                  # [B, K]
+y_logit = linear(dropout(c_hat))         # [B, 1]
 ```
+
+其中 `K = len(selected_concepts)`；当前默认 `selected_concepts = [C1..C7]`，可选概念全集仍为 `C1..C8`。
 
 硬瓶颈约束：
 
@@ -71,14 +73,14 @@ y_logit = label_head(c_hat)  # [B, 1]
 2. `label`
 3. `patient_id`
 4. `slice_index`
-5. `concept_true_raw`（shape `[8]`）
-6. `concept_true_std`（shape `[8]`）
+5. `concept_true_raw`（shape `[K]`）
+6. `concept_true_std`（shape `[K]`）
 
 强校验：
 
 1. 患者 ID 全覆盖
 2. `label` 与 `concept_labels.csv:y_true` 一致
-3. 概念维度固定 8
+3. 概念维度必须与 `selected_concepts` 一致（当前默认 `K=7`）
 4. scaler 统计合法（`std > 0`）
 
 ---
@@ -105,7 +107,7 @@ y_logit = label_head(c_hat)  # [B, 1]
    - `stage1_concept_log.csv`
    - `stage2_label_head_log.csv`
    - `stage3_joint_log.csv`
-5. Stage2/3 BCE 使用患者级统计得到的 `pos_weight`
+5. 标签 loss 的类别重加权由配置决定；当前默认 Stage2/3 通过 stage override 关闭 `pos_weight`，但仍记录患者级原始 `pos_weight` 供审计
 6. 训练结束自动触发患者级评估导出
 
 ### 5.3 CLI 覆盖
@@ -190,7 +192,7 @@ python habitat_CBM/repo/srcs/train_habitat_CBM.py \
 
 输入：`concept_proxy_features_<run_id>.csv`
 
-固定映射为 `c1_true...c8_true`，输出：
+标签资产固定导出 `c1_true...c8_true` 全量列；训练/评估阶段可通过 `model.selected_concepts` 选择子集（当前默认 `C1..C7`）。输出：
 
 1. `concept_labels.csv`
 2. `concept_statistics.csv`

@@ -68,10 +68,12 @@ class HabitatCBM(nn.Module):
     """Habitat-CBM 主模型（硬概念瓶颈，纯结构）。
 
     结构：
-        z = encoder(x)               # [B, 512]
-        c_hat = concept_head(z)      # [B, n_concepts]
-        y_logit = label_head(c_hat)  # [B, 1]
+        z = encoder(x)                    # [B, 512]
+        c_hat = concept_head(z)           # [B, n_concepts]
+        y_logit = linear(dropout(c_hat))  # [B, 1]
     """
+
+    LABEL_HEAD_TYPE = "dropout_linear"
 
     def __init__(
         self,
@@ -92,10 +94,6 @@ class HabitatCBM(nn.Module):
         if concept_hidden_dim <= 0:
             raise ValueError(
                 f"concept_hidden_dim must be positive, got {concept_hidden_dim}."
-            )
-        if label_hidden_dim <= 0:
-            raise ValueError(
-                f"label_hidden_dim must be positive, got {label_hidden_dim}."
             )
 
         shared_dropout = float(dropout_p) if dropout_p is not None else None
@@ -120,6 +118,9 @@ class HabitatCBM(nn.Module):
             )
 
         self.n_concepts = n_concepts
+        # `label_hidden_dim` 保留在接口中，仅用于兼容旧配置/旧 checkpoint 元数据。
+        self.label_hidden_dim = int(label_hidden_dim)
+        self.label_head_type = self.LABEL_HEAD_TYPE
         self.encoder = ResNet18Backbone(in_channels=in_channels, pretrained=pretrained)
         self.concept_head = nn.Sequential(
             nn.Linear(self.encoder.out_dim, concept_hidden_dim),
@@ -128,10 +129,8 @@ class HabitatCBM(nn.Module):
             nn.Linear(concept_hidden_dim, n_concepts),
         )
         self.label_head = nn.Sequential(
-            nn.Linear(n_concepts, label_hidden_dim),
-            nn.ReLU(inplace=True),
             nn.Dropout(label_dropout_p),
-            nn.Linear(label_hidden_dim, 1),
+            nn.Linear(n_concepts, 1),
         )
 
     def _validate_concept_tensor(self, c: torch.Tensor, tensor_name: str) -> None:
@@ -192,6 +191,7 @@ if __name__ == "__main__":
     x = torch.randn(2, 35, 224, 224)
     out = model.forward_x_to_cy(x)
     print("HabitatCBM (pure model) self-check passed.")
+    print(f"  label_head    : {model.label_head_type}")
     print(f"  z shape       : {tuple(out['z'].shape)}")
     print(f"  c_hat shape   : {tuple(out['c_hat'].shape)}")
     print(f"  y_logit shape : {tuple(out['y_logit'].shape)}")

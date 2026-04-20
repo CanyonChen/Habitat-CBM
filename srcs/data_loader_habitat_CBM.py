@@ -37,8 +37,74 @@ from srcs.data_loader import (
     str2bool,
 )
 
-DEFAULT_CONCEPT_NAMES = tuple(f"c{i}" for i in range(1, 9))
+AVAILABLE_CONCEPT_NAMES = tuple(f"c{i}" for i in range(1, 9))
+DEFAULT_CONCEPT_NAMES = tuple(f"c{i}" for i in range(1, 8))
 DEFAULT_CONCEPT_COLUMNS = tuple(f"{name}_true" for name in DEFAULT_CONCEPT_NAMES)
+
+
+def _concept_sort_key(name: str) -> Tuple[int, str]:
+    suffix = str(name)[1:]
+    return (int(suffix), str(name)) if suffix.isdigit() else (10**9, str(name))
+
+
+def resolve_concept_names(
+    selected_concepts: object,
+    *,
+    available_concept_names: Sequence[str] = AVAILABLE_CONCEPT_NAMES,
+    default_concept_names: Sequence[str] = DEFAULT_CONCEPT_NAMES,
+    allow_none: bool = False,
+) -> Optional[Tuple[str, ...]]:
+    """解析概念选择配置，返回规范化后的 concept id 元组。
+
+    支持：
+    - null / None：在 allow_none=True 时返回 None，否则返回 default_concept_names
+    - JSON 数组：["C1", "c2", "c7"]
+    - 逗号分隔字符串："C1,C2,C7"
+    """
+
+    available = tuple(str(name).strip().lower() for name in available_concept_names if str(name).strip())
+    if not available:
+        raise ValueError("available_concept_names must not be empty.")
+    default = tuple(str(name).strip().lower() for name in default_concept_names if str(name).strip())
+    if not default:
+        raise ValueError("default_concept_names must not be empty.")
+    invalid_defaults = sorted(set(default) - set(available), key=_concept_sort_key)
+    if invalid_defaults:
+        raise ValueError(
+            f"default_concept_names contains unsupported ids: {invalid_defaults}. "
+            f"Valid options: {list(available)}"
+        )
+
+    if selected_concepts is None:
+        return None if allow_none else default
+
+    if isinstance(selected_concepts, str):
+        tokens = [item.strip() for item in selected_concepts.split(",") if item.strip()]
+    elif isinstance(selected_concepts, Sequence) and not isinstance(selected_concepts, (str, bytes)):
+        tokens = [str(item).strip() for item in selected_concepts if str(item).strip()]
+    else:
+        raise ValueError(
+            "selected_concepts must be null, a list, or a comma-separated string."
+        )
+
+    normalized: List[str] = []
+    for token in tokens:
+        concept_name = token.lower()
+        if concept_name not in available:
+            raise ValueError(
+                f"Unsupported concept id '{token}'. Valid options: {list(available)}"
+            )
+        if concept_name in normalized:
+            raise ValueError(f"Duplicate concept id in selected_concepts: {token}")
+        normalized.append(concept_name)
+
+    if not normalized:
+        raise ValueError("selected_concepts must contain at least one concept.")
+    return tuple(normalized)
+
+
+def concept_names_to_columns(concept_names: Sequence[str]) -> Tuple[str, ...]:
+    return tuple(f"{str(name).strip().lower()}_true" for name in concept_names)
 
 
 @dataclass(frozen=True)
@@ -159,7 +225,10 @@ def load_concept_labels(
     return mapping
 
 
-def load_concept_scaler(concept_scaler_json: str | Path) -> ConceptScaler:
+def load_concept_scaler(
+    concept_scaler_json: str | Path,
+    concept_names: Sequence[str] | None = None,
+) -> ConceptScaler:
     """读取 concept_scaler_stats.json。"""
 
     path = Path(concept_scaler_json)
@@ -174,14 +243,20 @@ def load_concept_scaler(concept_scaler_json: str | Path) -> ConceptScaler:
     if not isinstance(concepts, Mapping):
         raise ValueError("Invalid scaler JSON: 'concepts' must be a mapping.")
 
-    concept_names = sorted(concepts.keys(), key=lambda item: int(item[1:]) if item[1:].isdigit() else item)
-    if not concept_names:
+    available_concept_names = tuple(sorted(concepts.keys(), key=_concept_sort_key))
+    if not available_concept_names:
         raise ValueError("Invalid scaler JSON: no concept entries found.")
+
+    selected_concept_names = (
+        tuple(resolve_concept_names(concept_names, available_concept_names=available_concept_names))
+        if concept_names is not None
+        else available_concept_names
+    )
 
     means: List[float] = []
     stds: List[float] = []
     source_columns: List[str] = []
-    for concept_name in concept_names:
+    for concept_name in selected_concept_names:
         item = concepts[concept_name]
         if not isinstance(item, Mapping):
             raise ValueError(f"Invalid scaler JSON entry for {concept_name}")
@@ -203,7 +278,7 @@ def load_concept_scaler(concept_scaler_json: str | Path) -> ConceptScaler:
 
     fit_split = str(payload.get("fit_split", "train"))
     return ConceptScaler(
-        concept_names=tuple(concept_names),
+        concept_names=tuple(selected_concept_names),
         mean=np.asarray(means, dtype=np.float32),
         std=np.asarray(stds, dtype=np.float32),
         fit_split=fit_split,
@@ -257,11 +332,21 @@ class HabitatIDHBlockDataset(_BaseHabitatIDHBlockDataset):
                 raise ValueError(
                     "When concept mode is enabled, both concept_label_csv and concept_scaler_json are required."
                 )
+            concept_names_list: List[str] = []
+            for col in self.concept_columns:
+                concept_name = str(col).strip().lower()
+                if concept_name.endswith("_true"):
+                    concept_name = concept_name[:-5]
+                concept_names_list.append(concept_name)
+            concept_names = tuple(concept_names_list)
             self._concept_map = load_concept_labels(
                 concept_label_csv=concept_label_csv,
                 concept_columns=self.concept_columns,
             )
-            self._concept_scaler = load_concept_scaler(concept_scaler_json)
+            self._concept_scaler = load_concept_scaler(
+                concept_scaler_json,
+                concept_names=concept_names,
+            )
             self._validate_concept_alignment()
 
     @property
@@ -392,6 +477,7 @@ def build_habitat_cbm_datasets(
     cache_volumes: bool = True,
     concept_label_csv: str | Path | None = None,
     concept_scaler_json: str | Path | None = None,
+    concept_columns: Sequence[str] | None = None,
     transform_map: Optional[Mapping[str, object]] = None,
 ) -> Dict[str, HabitatIDHBlockDataset]:
     """构建 train/val/test 三个 CBM 数据集。"""
@@ -419,6 +505,7 @@ def build_habitat_cbm_datasets(
             transform=transform,
             concept_label_csv=concept_label_csv,
             concept_scaler_json=concept_scaler_json,
+            concept_columns=concept_columns if concept_columns is not None else DEFAULT_CONCEPT_COLUMNS,
         )
     return datasets
 
@@ -475,6 +562,12 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-volumes", type=str2bool, default=True)
     parser.add_argument("--concept-label-csv", type=Path, default=None)
     parser.add_argument("--concept-scaler-json", type=Path, default=None)
+    parser.add_argument(
+        "--selected-concepts",
+        type=str,
+        default=None,
+        help="Comma-separated concept ids, e.g. C1,C2,C3",
+    )
     parser.add_argument("--max-samples", type=int, default=3)
     return parser
 
@@ -494,6 +587,11 @@ def _main() -> None:
         return_metadata=True,
         concept_label_csv=args.concept_label_csv,
         concept_scaler_json=args.concept_scaler_json,
+        concept_columns=(
+            concept_names_to_columns(resolve_concept_names(args.selected_concepts))
+            if args.selected_concepts is not None
+            else DEFAULT_CONCEPT_COLUMNS
+        ),
     )
 
     summary = dataset.summary()

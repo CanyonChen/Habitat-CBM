@@ -50,7 +50,9 @@ from srcs.data_loader_habitat_CBM import (
     PatientConceptDataset,
     build_habitat_cbm_dataloaders,
     build_habitat_cbm_datasets,
+    concept_names_to_columns,
     load_concept_scaler,
+    resolve_concept_names,
 )
 from srcs.eval_habitat_CBM import run_full_evaluation
 from srcs.monai_augmentation import MonaiAugmentConfig, build_monai_block_transforms
@@ -1808,6 +1810,8 @@ def main() -> None:
     split_base_root = Path(paths_cfg["split_base_root"])
     concept_label_csv = Path(paths_cfg["concept_label_csv"])
     concept_scaler_json = Path(paths_cfg["concept_scaler_json"])
+    selected_concept_names = resolve_concept_names(model_cfg.get("selected_concepts"))
+    concept_columns = concept_names_to_columns(selected_concept_names)
 
     transform_map = _build_transforms(data_cfg=data_cfg, train_cfg=train_cfg)
     datasets = build_habitat_cbm_datasets(
@@ -1823,6 +1827,7 @@ def main() -> None:
         cache_volumes=bool(data_cfg.get("cache_volumes", True)),
         concept_label_csv=concept_label_csv,
         concept_scaler_json=concept_scaler_json,
+        concept_columns=concept_columns,
         transform_map=transform_map,
     )
     dataloaders = build_habitat_cbm_dataloaders(
@@ -1832,13 +1837,23 @@ def main() -> None:
         train_shuffle=True,
         patient_balanced_sampling=bool(train_cfg.get("patient_balanced_sampling", False)),
     )
-    scaler: ConceptScaler = load_concept_scaler(concept_scaler_json)
+    scaler: ConceptScaler = load_concept_scaler(
+        concept_scaler_json,
+        concept_names=selected_concept_names,
+    )
+    effective_n_concepts = len(scaler.concept_names)
+    configured_n_concepts = int(model_cfg.get("n_concepts", effective_n_concepts))
+    if configured_n_concepts != effective_n_concepts:
+        raise ValueError(
+            "model.n_concepts does not match selected concepts/scaler dimension: "
+            f"{configured_n_concepts} vs {effective_n_concepts}"
+        )
     in_channels = int(model_cfg.get("in_channels", _compute_input_channels(data_cfg)))
     concept_dropout_p, label_dropout_p = _resolve_model_dropouts(model_cfg)
 
     model = HabitatCBM(
         in_channels=in_channels,
-        n_concepts=int(model_cfg.get("n_concepts", len(scaler.concept_names))),
+        n_concepts=effective_n_concepts,
         concept_hidden_dim=int(model_cfg.get("concept_hidden_dim", 256)),
         label_hidden_dim=int(model_cfg.get("label_hidden_dim", 32)),
         concept_dropout_p=concept_dropout_p,
@@ -2015,9 +2030,11 @@ def main() -> None:
             run_id=run_id,
             model_config={
                 "in_channels": in_channels,
-                "n_concepts": int(model_cfg.get("n_concepts", len(scaler.concept_names))),
+                "n_concepts": effective_n_concepts,
+                "selected_concepts": list(scaler.concept_names),
                 "concept_hidden_dim": int(model_cfg.get("concept_hidden_dim", 256)),
                 "label_hidden_dim": int(model_cfg.get("label_hidden_dim", 32)),
+                "label_head_type": getattr(model, "label_head_type", "unknown"),
                 "concept_dropout_p": concept_dropout_p,
                 "label_dropout_p": label_dropout_p,
             },
@@ -2106,6 +2123,10 @@ def main() -> None:
         "run_id": run_id,
         "seed": seed,
         "device": str(device),
+        "architecture": {
+            "label_head_type": getattr(model, "label_head_type", "unknown"),
+            "label_hidden_dim_config": int(model_cfg.get("label_hidden_dim", 32)),
+        },
         "paths": {
             "run_dir": str(run_dir),
             "result_dir": str(result_dir),
@@ -2117,7 +2138,8 @@ def main() -> None:
             "concept_label_csv": str(concept_label_csv),
             "concept_scaler_json": str(concept_scaler_json),
             "input_channels": in_channels,
-            "n_concepts": int(model_cfg.get("n_concepts", len(scaler.concept_names))),
+            "n_concepts": effective_n_concepts,
+            "selected_concepts": list(scaler.concept_names),
             "train_patients": len(datasets["train"].patient_cases),
             "val_patients": len(datasets["val"].patient_cases),
             "test_patients": len(datasets["test"].patient_cases),

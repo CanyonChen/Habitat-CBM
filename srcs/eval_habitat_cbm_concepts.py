@@ -18,12 +18,11 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
-
-DEFAULT_CONCEPT_IDS = tuple(f"c{i}" for i in range(1, 9))
 
 
 def _read_csv(path: Path) -> List[Dict[str, str]]:
@@ -121,8 +120,13 @@ def evaluate_concepts(
     if use_scale not in {"raw", "std"}:
         raise ValueError(f"Unsupported scale: {use_scale}")
 
-    # 自动发现概念编号（优先 c1..c8）
-    concept_ids = [cid for cid in DEFAULT_CONCEPT_IDS if f"{cid}_true_{use_scale}" in rows[0]]
+    matched_concept_ids: List[Tuple[int, str]] = []
+    for key in rows[0].keys():
+        m = re.fullmatch(rf"c(\d+)_true_{use_scale}", str(key))
+        if m is None:
+            continue
+        matched_concept_ids.append((int(m.group(1)), f"c{int(m.group(1))}"))
+    concept_ids = [item[1] for item in sorted(matched_concept_ids, key=lambda item: item[0])]
     if not concept_ids:
         raise ValueError(
             f"No concept columns found for scale='{use_scale}'. "

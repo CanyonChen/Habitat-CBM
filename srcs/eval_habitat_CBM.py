@@ -54,7 +54,9 @@ from srcs.data_loader_habitat_CBM import (
     ConceptScaler,
     build_habitat_cbm_dataloaders,
     build_habitat_cbm_datasets,
+    concept_names_to_columns,
     load_concept_scaler,
+    resolve_concept_names,
 )
 from srcs.monai_augmentation import MonaiAugmentConfig, build_monai_block_transforms
 
@@ -389,13 +391,13 @@ def _aggregate_patient_concept_rows(
             "run_id": run_id,
             "checkpoint_name": checkpoint_name,
         }
-        for idx, concept_name in enumerate(scaler.concept_names, start=1):
-            row[f"c{idx}_true_std"] = float(c_true_std[idx - 1])
-            row[f"c{idx}_pred_std"] = float(c_pred_std[idx - 1])
-            row[f"c{idx}_abs_error_std"] = float(abs(c_pred_std[idx - 1] - c_true_std[idx - 1]))
-            row[f"c{idx}_true_raw"] = float(c_true_raw[idx - 1])
-            row[f"c{idx}_pred_raw"] = float(c_pred_raw[idx - 1])
-            row[f"c{idx}_abs_error_raw"] = float(abs(c_pred_raw[idx - 1] - c_true_raw[idx - 1]))
+        for idx, concept_name in enumerate(scaler.concept_names):
+            row[f"{concept_name}_true_std"] = float(c_true_std[idx])
+            row[f"{concept_name}_pred_std"] = float(c_pred_std[idx])
+            row[f"{concept_name}_abs_error_std"] = float(abs(c_pred_std[idx] - c_true_std[idx]))
+            row[f"{concept_name}_true_raw"] = float(c_true_raw[idx])
+            row[f"{concept_name}_pred_raw"] = float(c_pred_raw[idx])
+            row[f"{concept_name}_abs_error_raw"] = float(abs(c_pred_raw[idx] - c_true_raw[idx]))
         patient_rows.append(row)
 
     return patient_rows
@@ -1079,6 +1081,7 @@ def build_eval_datasets_and_loaders(
     data_cfg: Mapping[str, object],
     batch_size: int,
     num_workers: int,
+    concept_columns: Sequence[str] | None = None,
 ) -> Tuple[Dict[str, object], Dict[str, object]]:
     has_mask = bool(data_cfg.get("require_voi", True)) or bool(data_cfg.get("append_voi_mask", True)) or bool(
         data_cfg.get("mask_background_with_voi", False)
@@ -1103,6 +1106,7 @@ def build_eval_datasets_and_loaders(
         cache_volumes=bool(data_cfg.get("cache_volumes", True)),
         concept_label_csv=concept_label_csv,
         concept_scaler_json=concept_scaler_json,
+        concept_columns=concept_columns,
         transform_map=transform_map,
     )
 
@@ -1195,6 +1199,16 @@ def _resolve_run_id(run_id: str | None) -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
 
+def _load_model_config_from_checkpoint(checkpoint_path: Path) -> Dict[str, object]:
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping):
+        raise ValueError("Unsupported checkpoint format.")
+    model_cfg = payload.get("model_config", {})
+    if not isinstance(model_cfg, Mapping):
+        raise ValueError("Checkpoint missing model_config.")
+    return dict(model_cfg)
+
+
 def _load_model_from_checkpoint(checkpoint_path: Path, device: torch.device) -> HabitatCBM:
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if not isinstance(payload, Mapping):
@@ -1204,10 +1218,17 @@ def _load_model_from_checkpoint(checkpoint_path: Path, device: torch.device) -> 
     if not isinstance(model_cfg, Mapping):
         raise ValueError("Checkpoint missing model_config.")
     concept_dropout_p, label_dropout_p = _resolve_model_dropouts(model_cfg)
+    checkpoint_selected_concepts = model_cfg.get("selected_concepts")
+    if "n_concepts" in model_cfg:
+        checkpoint_n_concepts = int(model_cfg["n_concepts"])
+    elif checkpoint_selected_concepts is not None:
+        checkpoint_n_concepts = len(resolve_concept_names(checkpoint_selected_concepts))
+    else:
+        checkpoint_n_concepts = 8
 
     model = HabitatCBM(
         in_channels=int(model_cfg["in_channels"]),
-        n_concepts=int(model_cfg.get("n_concepts", 8)),
+        n_concepts=checkpoint_n_concepts,
         concept_hidden_dim=int(model_cfg.get("concept_hidden_dim", 256)),
         label_hidden_dim=int(model_cfg.get("label_hidden_dim", 32)),
         concept_dropout_p=concept_dropout_p,
@@ -1229,12 +1250,20 @@ def main() -> None:
 
     paths_cfg = cfg.get("paths", {})
     data_cfg = cfg.get("data", {})
+    model_cfg = cfg.get("model", {})
     eval_cfg = cfg.get("eval", {})
     train_cfg = cfg.get("train", {})
+    if not isinstance(model_cfg, Mapping):
+        model_cfg = {}
 
     split_base_root = Path(paths_cfg.get("split_base_root", REPO_ROOT.parent / "dataset" / "splited_data"))
     concept_label_csv = Path(paths_cfg.get("concept_label_csv", REPO_ROOT.parent / "results" / "02_habitat" / "concept_labels.csv"))
     concept_scaler_json = Path(paths_cfg.get("concept_scaler_json", REPO_ROOT.parent / "results" / "03_habitat_cbm" / "concept_scaler_stats.json"))
+    checkpoint_model_cfg = _load_model_config_from_checkpoint(args.checkpoint)
+    selected_concept_names = resolve_concept_names(
+        model_cfg.get("selected_concepts", checkpoint_model_cfg.get("selected_concepts"))
+    )
+    concept_columns = concept_names_to_columns(selected_concept_names)
 
     run_id = _resolve_run_id(args.run_id)
     output_dir = args.output_dir
@@ -1256,7 +1285,10 @@ def main() -> None:
         figure_include_splits = tuple(include_splits)
 
     device = torch.device(args.device)
-    scaler = load_concept_scaler(concept_scaler_json)
+    scaler = load_concept_scaler(
+        concept_scaler_json,
+        concept_names=selected_concept_names,
+    )
 
     _, dataloaders = build_eval_datasets_and_loaders(
         split_base_root=split_base_root,
@@ -1265,9 +1297,15 @@ def main() -> None:
         data_cfg=data_cfg,
         batch_size=batch_size,
         num_workers=num_workers,
+        concept_columns=concept_columns,
     )
 
     model = _load_model_from_checkpoint(args.checkpoint, device=device)
+    if model.n_concepts != len(scaler.concept_names):
+        raise ValueError(
+            "Checkpoint n_concepts does not match selected concepts/scaler dimension: "
+            f"{model.n_concepts} vs {len(scaler.concept_names)}"
+        )
 
     exported = run_full_evaluation(
         model=model,

@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
@@ -38,7 +39,18 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from models.habitat_CBM import HabitatCBM
-from srcs.data_loader_habitat_CBM import load_concept_scaler
+from srcs.data_loader_habitat_CBM import load_concept_scaler, resolve_concept_names
+
+
+def _extract_concept_ids_from_row(row: Mapping[str, str]) -> List[str]:
+    matched: List[Tuple[int, str]] = []
+    for key in row.keys():
+        m = re.fullmatch(r"c(\d+)_abs_error_std", str(key))
+        if m is None:
+            continue
+        matched.append((int(m.group(1)), f"c{int(m.group(1))}"))
+    matched.sort(key=lambda item: item[0])
+    return [item[1] for item in matched]
 
 
 def _read_csv(path: Path) -> List[Dict[str, str]]:
@@ -132,7 +144,7 @@ def _build_patient_maps(
     split: str,
     threshold: float,
     scaler_json: Path,
-) -> Tuple[Dict[str, Dict[str, object]], List[str], int]:
+) -> Tuple[Dict[str, Dict[str, object]], List[str], List[str]]:
     pred_map: Dict[str, Dict[str, object]] = {}
     for row in prediction_rows:
         row_split = str(row.get("split", "")).strip().lower()
@@ -161,8 +173,13 @@ def _build_patient_maps(
     if not pred_map:
         raise ValueError(f"No prediction rows available for split={split}.")
 
-    scaler = load_concept_scaler(scaler_json)
-    n_concepts = len(scaler.concept_names)
+    concept_ids = _extract_concept_ids_from_row(concept_rows[0]) if concept_rows else []
+    scaler = load_concept_scaler(
+        scaler_json,
+        concept_names=concept_ids if concept_ids else None,
+    )
+    concept_ids = list(scaler.concept_names)
+    n_concepts = len(concept_ids)
 
     concept_map: Dict[str, Dict[str, np.ndarray]] = {}
     for row in concept_rows:
@@ -173,10 +190,10 @@ def _build_patient_maps(
         if patient_id not in pred_map:
             continue
 
-        true_std_cols = [f"c{i}_true_std" for i in range(1, n_concepts + 1)]
-        pred_std_cols = [f"c{i}_pred_std" for i in range(1, n_concepts + 1)]
-        true_raw_cols = [f"c{i}_true_raw" for i in range(1, n_concepts + 1)]
-        pred_raw_cols = [f"c{i}_pred_raw" for i in range(1, n_concepts + 1)]
+        true_std_cols = [f"{concept_id}_true_std" for concept_id in concept_ids]
+        pred_std_cols = [f"{concept_id}_pred_std" for concept_id in concept_ids]
+        true_raw_cols = [f"{concept_id}_true_raw" for concept_id in concept_ids]
+        pred_raw_cols = [f"{concept_id}_pred_raw" for concept_id in concept_ids]
 
         has_std = all(col in row and str(row[col]).strip() != "" for col in true_std_cols + pred_std_cols)
         has_raw = all(col in row and str(row[col]).strip() != "" for col in true_raw_cols + pred_raw_cols)
@@ -226,7 +243,7 @@ def _build_patient_maps(
         pred_map[patient_id].update(item)
 
     patient_ids = sorted(pred_map.keys())
-    return pred_map, patient_ids, n_concepts
+    return pred_map, patient_ids, concept_ids
 
 
 def _load_model_from_checkpoint(
@@ -248,10 +265,17 @@ def _load_model_from_checkpoint(
     else:
         concept_dropout_p = float(model_cfg.get("concept_dropout_p", 0.3))
         label_dropout_p = float(model_cfg.get("label_dropout_p", 0.1))
+    checkpoint_selected_concepts = model_cfg.get("selected_concepts")
+    if "n_concepts" in model_cfg:
+        checkpoint_n_concepts = int(model_cfg["n_concepts"])
+    elif checkpoint_selected_concepts is not None:
+        checkpoint_n_concepts = len(resolve_concept_names(checkpoint_selected_concepts))
+    else:
+        checkpoint_n_concepts = fallback_n_concepts
 
     model = HabitatCBM(
         in_channels=int(model_cfg.get("in_channels", fallback_in_channels)),
-        n_concepts=int(model_cfg.get("n_concepts", fallback_n_concepts)),
+        n_concepts=checkpoint_n_concepts,
         concept_hidden_dim=int(model_cfg.get("concept_hidden_dim", 256)),
         label_hidden_dim=int(model_cfg.get("label_hidden_dim", 32)),
         concept_dropout_p=concept_dropout_p,
@@ -288,13 +312,14 @@ def run_intervention(
     pred_rows = _read_csv(patient_predictions_csv)
     concept_rows = _read_csv(patient_concepts_csv)
 
-    patient_map, patient_ids, n_concepts_from_data = _build_patient_maps(
+    patient_map, patient_ids, concept_ids = _build_patient_maps(
         prediction_rows=pred_rows,
         concept_rows=concept_rows,
         split=split,
         threshold=threshold,
         scaler_json=concept_scaler_json,
     )
+    n_concepts_from_data = len(concept_ids)
     budgets = _parse_budgets(budgets_text, n_concepts=n_concepts_from_data)
 
     device = torch.device(device_name)
@@ -370,7 +395,7 @@ def run_intervention(
                 "split": item["split"],
                 "y_true": int(item["y_true"]),
                 "budget_k": int(budget_k),
-                "concepts_replaced": "|".join(str(int(idx) + 1) for idx in replace_idx.tolist()),
+                "concepts_replaced": "|".join(concept_ids[int(idx)] for idx in replace_idx.tolist()),
                 "prob_before": float(item["prob_before"]),
                 "prob_after": prob_after,
                 "pred_before": pred_before,
