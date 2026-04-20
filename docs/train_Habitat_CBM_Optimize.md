@@ -32,7 +32,7 @@ x [B, 35, 224, 224]
 | Stage | 冻结模块 | 训练模块 | Loss | 监控指标 |
 |-------|---------|---------|------|---------|
 | Stage1 | label_head | encoder + concept_head | MSE/SmoothL1（概念回归） | `-val_concept_loss`（越大越好） |
-| Stage2 | encoder + concept_head | label_head | BCE（使用真实概念 `c_true_std`） | `val_auc` |
+| Stage2 | encoder + concept_head | label_head | BCE（使用真实概念 `c_true_std`） | `-val_label_loss`（主监控） + `val_auc`（tie-break） |
 | Stage3 | 浅层 encoder（可配置） | layer4 + concept_head + label_head | `λ_c × concept_loss + λ_y × label_loss` | `val_auc` |
 
 > **Stage3 冻结说明**：Stage3 默认冻结 `conv1/bn1/layer1/layer2/layer3`，与 Stage1 行为对称，防止联合微调时浅层特征大幅偏移。可通过 `stages.stage3.freeze_encoder_layers` 参数化控制。
@@ -90,7 +90,7 @@ Stage2 使用真实概念标签输入（oracle 模式），val AUC 达 **0.896**
 | OPT-6 | Stage1 调度器优化 | ✅ 已实现 | `stages.stage1.scheduler`: `factor=0.3`，`patience=3` | `args_train_habitat_CBM.json` |
 | OPT-7 | 放宽早停 | ✅ 已实现 | `early_stop_patience=20`，`early_stop_min_delta=0.002` | `args_train_habitat_CBM.json` |
 | OPT-8 | 患者均衡采样 | ✅ 已实现 | `train.patient_balanced_sampling=true`，使用 `WeightedRandomSampler` | `data_loader_habitat_CBM.py` |
-| OPT-9 | Stage2 患者级 + 概念噪声（A+B） | ✅ 已实现 | `stages.stage2.patient_level=true`，`concept_noise_std=0.15` | `data_loader_habitat_CBM.py` + `train_habitat_CBM.py` |
+| OPT-9 | Stage2 患者级 + 残差感知概念噪声（A+B） | ✅ 已实现 | `stages.stage2.patient_level=true`，`concept_noise_mode=residual`，`concept_noise_std=0.1` | `data_loader_habitat_CBM.py` + `train_habitat_CBM.py` |
 | OPT-11 | 更鲁棒概念 loss | ✅ 已实现 | `loss.concept.name=smooth_l1`，`beta=0.5` | `args_train_habitat_CBM.json` |
 | NEW-1 | Stage3 encoder 冻结层参数化 | ✅ 已实现 | `stages.stage3.freeze_encoder_layers=["conv1","bn1","layer1","layer2","layer3"]` | `args_train_habitat_CBM.json` + `train_habitat_CBM.py` |
 | NEW-2 | PNG 结果图导出 | ✅ 已实现 | `eval.export_png=true`，`figure_dpi=300` | `eval_habitat_CBM.py` |
@@ -364,24 +364,29 @@ Stage2 使用真实概念标签输入（oracle 模式），val AUC 达 **0.896**
 
 ---
 
-### 优化 OPT-9：将 Stage2 改为患者级训练，并加入概念噪声鲁棒性（**高优先级**）
+### 优化 OPT-9：将 Stage2 改为患者级训练，并加入残差感知概念噪声鲁棒性（**高优先级**）
 
 **目标**：缓解 Stage2 oracle 到 Stage3 predicted concept 的分布偏移。
 
-**实现状态**：✅ **已实现 A+B**。已接入 `PatientConceptDataset`（患者级 Stage2）与训练期概念噪声 `concept_noise_std`；未实现 Bridge Stage（C）。
+**实现状态**：✅ **已实现 A+B**。已接入 `PatientConceptDataset`（患者级 Stage2）与训练期残差感知概念噪声；未实现 Bridge Stage（C）。
 
 **当前配置**（`stages.stage2`）：
 
 ```json
 "stage2": {
   "patient_level": true,
-  "concept_noise_std": 0.15
+  "monitor_metric": "label_loss",
+  "concept_noise_mode": "residual",
+  "concept_noise_std": 0.1,
+  "concept_noise_min_std": 0.02,
+  "concept_noise_max_std": null
 }
 ```
 
 **方案说明**：
 - **方案 A（患者级去重）**：Stage2 每位患者只出现一次，避免按 block 数加权的 `C→Y` 过拟合。
-- **方案 B（概念噪声）**：训练期注入高斯噪声 `σ=0.15`，让 label_head 在噪声概念下保持鲁棒，缩小 Stage2 oracle 与 Stage3 `c_hat` 之间的分布差距；验证期不注入噪声。
+- **方案 B（残差感知概念噪声）**：Stage1 结束并加载最优 checkpoint 后，训练脚本在 train split 上计算患者级 `mean_block(c_hat_stage1) - c_true_std` 残差；Stage2 训练时按各概念残差标准差比例分配噪声强度，同时保持 `concept_noise_std` 指定的平均噪声强度。验证期不注入噪声。
+- **监控指标修正**：Stage2 默认用 `val_label_loss` 选择最优 checkpoint，并在 loss 持平时用 `val_auc` 作为 tie-break。原因是患者级 val 集很小，AUC 离散度高，而 BCE loss 与 Stage2 的训练目标更一致。
 - **方案 C（Bridge Stage，未实现）**：冻结 encoder+concept_head，用 `c_hat.detach()` 单独训练 label_head，让其适配 Stage1 的概念预测误差分布后再进入 Stage3。
 
 ---
@@ -592,7 +597,8 @@ Run H     最优配置做 OPT-13（多 seed/CV）        Val/CV mean±std 是否
 | `stages.stage3.optimizer.lr_label_head` | *(继承全局 1e-4)* | **5e-6** | ✅ 已生效 | 小步更新分类头 |
 | `stages.stage3.freeze_encoder_layers` | *(无，全解冻)* | **["conv1","bn1","layer1","layer2","layer3"]** | ✅ 已生效 | 防止浅层偏移 |
 | `stages.stage2.patient_level` | *(不支持)* | **true** | ✅ 已生效 | Stage2 去 block 重复 |
-| `stages.stage2.concept_noise_std` | *(不支持)* | **0.15** | ✅ 已生效 | label_head 适应 `c_hat` 误差 |
+| `stages.stage2.concept_noise_mode` | *(不支持)* | **residual** | ✅ 已生效 | 用 Stage1 残差估计逐概念噪声 |
+| `stages.stage2.concept_noise_std` | *(不支持)* | **0.1** | ✅ 已生效 | residual 模式下的平均噪声强度 |
 | `train.early_stop_patience` | 10 | **20** | ✅ 已生效 | 给 LR 衰减留出训练窗口 |
 | `train.early_stop_min_delta` | 0.0 | **0.002** | ✅ 已生效 | 过滤小幅随机波动 |
 | `train.patient_balanced_sampling` | *(不支持)* | **true** | ✅ 已生效 | 患者级梯度均衡 |
@@ -708,12 +714,12 @@ def build_patient_balanced_sampler(dataset: HabitatIDHBlockDataset) -> WeightedR
     )
 ```
 
-### 7.6 Stage2 患者级训练 + 概念噪声（OPT-9 A+B）
+### 7.6 Stage2 患者级训练 + 残差感知概念噪声（OPT-9 A+B）
 
 训练主循环当前实现：
 - Stage1/3 使用 block loader；
 - Stage2 在 `stages.stage2.patient_level=true` 时使用 patient loader；
-- Stage2 训练期在 `concept_noise_std>0` 时注入高斯噪声，验证期不注入。
+- Stage2 在 `concept_noise_mode=residual` 时，先用 Stage1 train split 患者级残差估计逐概念噪声标准差，再在训练期加到 `concept_true_std` 上；验证期不注入。
 
 ### 7.7 概念分布偏移诊断（OPT-9/OPT-11）
 

@@ -720,6 +720,23 @@ def _resolve_stage_label_loss_config(
     return resolved
 
 
+def _resolve_stage_monitor_metric(
+    stage_cfg: Mapping[str, object],
+    stage: TrainStage,
+) -> Optional[str]:
+    if stage != "stage2":
+        return None
+
+    metric = _normalize_key(stage_cfg.get("monitor_metric", "label_loss"))
+    valid = {"label_loss", "auc"}
+    if metric not in valid:
+        raise ValueError(
+            f"Unsupported stages.{stage}.monitor_metric: {metric}. "
+            f"Use one of {sorted(valid)}."
+        )
+    return metric
+
+
 def _extract_loader_labels(dataloader) -> Optional[np.ndarray]:
     dataset = getattr(dataloader, "dataset", None)
     if isinstance(dataset, PatientConceptDataset):
@@ -1163,6 +1180,7 @@ def _train_stage2_epoch(
     device: torch.device,
     pos_weight: Optional[torch.Tensor],
     concept_noise_std: float,
+    concept_noise_std_vector: Optional[torch.Tensor],
     label_loss_config: Mapping[str, object],
 ) -> Dict[str, float]:
     model.train()
@@ -1174,7 +1192,10 @@ def _train_stage2_epoch(
         y_true = batch["label"].to(device=device, dtype=torch.float32, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        if concept_noise_std > 0.0:
+        if concept_noise_std_vector is not None:
+            noise_std = concept_noise_std_vector.to(device=device, dtype=c_true_std.dtype).view(1, -1)
+            c_input = c_true_std + torch.randn_like(c_true_std) * noise_std
+        elif concept_noise_std > 0.0:
             c_input = c_true_std + torch.randn_like(c_true_std) * float(concept_noise_std)
         else:
             c_input = c_true_std
@@ -1193,6 +1214,114 @@ def _train_stage2_epoch(
         total_count += batch_size
 
     return {"label_loss": total_loss / max(total_count, 1)}
+
+
+@torch.no_grad()
+def _estimate_stage2_residual_noise_std(
+    model: HabitatCBM,
+    dataloader,
+    device: torch.device,
+    base_noise_std: float,
+    eval_transform: object = None,
+    min_noise_std: float = 0.0,
+    max_noise_std: Optional[float] = None,
+) -> Tuple[Optional[torch.Tensor], Dict[str, object]]:
+    """Estimate per-concept Stage2 noise from Stage1 train residuals.
+
+    Residuals are computed at patient level:
+        mean_block(c_hat_stage1) - c_true_std
+
+    The returned noise vector preserves the average configured noise strength
+    (`base_noise_std`) while scaling each concept by its residual std ratio.
+    """
+
+    if base_noise_std <= 0.0:
+        return None, {
+            "mode": "disabled",
+            "base_noise_std": float(base_noise_std),
+            "num_patients": 0,
+        }
+    if min_noise_std < 0.0:
+        raise ValueError(f"min_noise_std must be >= 0, got {min_noise_std}")
+    if max_noise_std is not None and max_noise_std <= 0.0:
+        raise ValueError(f"max_noise_std must be positive when set, got {max_noise_std}")
+    if max_noise_std is not None and max_noise_std < min_noise_std:
+        raise ValueError(
+            f"max_noise_std must be >= min_noise_std, got {max_noise_std} < {min_noise_std}"
+        )
+
+    dataset = getattr(dataloader, "dataset", None)
+    original_transform = getattr(dataset, "transform", None) if dataset is not None else None
+    swapped_transform = dataset is not None and hasattr(dataset, "transform") and eval_transform is not None
+
+    pred_sums: Dict[str, torch.Tensor] = {}
+    true_by_patient: Dict[str, torch.Tensor] = {}
+    counts: Dict[str, int] = {}
+
+    was_training = model.training
+    model.eval()
+    if swapped_transform:
+        dataset.transform = eval_transform
+    try:
+        for batch in dataloader:
+            x = batch["image"].to(device=device, dtype=torch.float32, non_blocking=True)
+            c_true_std = batch["concept_true_std"].to(device=device, dtype=torch.float32, non_blocking=True)
+            out = model.forward_x_to_cy(x)
+            c_hat = out["c_hat"].detach().cpu()
+            c_true_cpu = c_true_std.detach().cpu()
+            patient_ids = batch["patient_id"]
+
+            for idx in range(int(c_hat.shape[0])):
+                patient_id = str(patient_ids[idx])
+                if patient_id not in pred_sums:
+                    pred_sums[patient_id] = c_hat[idx].clone()
+                    true_by_patient[patient_id] = c_true_cpu[idx].clone()
+                    counts[patient_id] = 1
+                else:
+                    pred_sums[patient_id] = pred_sums[patient_id] + c_hat[idx]
+                    counts[patient_id] += 1
+    finally:
+        if swapped_transform:
+            dataset.transform = original_transform
+        if was_training:
+            model.train()
+
+    if len(pred_sums) < 2:
+        raise RuntimeError(
+            "Need at least two patients to estimate residual-aware concept noise, "
+            f"got {len(pred_sums)}."
+        )
+
+    residual_rows: List[torch.Tensor] = []
+    for patient_id in sorted(pred_sums.keys()):
+        pred_mean = pred_sums[patient_id] / float(counts[patient_id])
+        residual_rows.append(pred_mean - true_by_patient[patient_id])
+
+    residuals = torch.stack(residual_rows, dim=0).float()
+    residual_mean = residuals.mean(dim=0)
+    residual_std = residuals.std(dim=0, unbiased=False)
+    residual_std_mean = residual_std.mean().clamp_min(1e-8)
+
+    noise_std = residual_std / residual_std_mean * float(base_noise_std)
+    if min_noise_std > 0.0:
+        noise_std = torch.clamp(noise_std, min=float(min_noise_std))
+    if max_noise_std is not None:
+        noise_std = torch.clamp(noise_std, max=float(max_noise_std))
+
+    summary = {
+        "mode": "residual",
+        "base_noise_std": float(base_noise_std),
+        "min_noise_std": float(min_noise_std),
+        "max_noise_std": float(max_noise_std) if max_noise_std is not None else None,
+        "num_patients": int(len(pred_sums)),
+        "residual_mean": [float(v) for v in residual_mean.tolist()],
+        "residual_std": [float(v) for v in residual_std.tolist()],
+        "noise_std": [float(v) for v in noise_std.tolist()],
+        "noise_std_mean": float(noise_std.mean().item()),
+        "noise_std_min": float(noise_std.min().item()),
+        "noise_std_max": float(noise_std.max().item()),
+    }
+    return noise_std.to(device=device, dtype=torch.float32), summary
 
 
 def _eval_stage2_epoch(
@@ -1410,9 +1539,13 @@ def _train_stage_loop(
     lambda_y: float,
     pos_weight: Optional[torch.Tensor],
     concept_noise_std: float,
+    concept_noise_std_vector: Optional[torch.Tensor],
+    concept_noise_summary: Optional[Mapping[str, object]],
+    stage_monitor_metric: Optional[str],
 ) -> Tuple[int, float, List[Dict[str, object]]]:
     best_epoch = -1
     best_score = -float("inf")
+    best_tie_break_score = -float("inf")
     no_improve = 0
     history: List[Dict[str, object]] = []
     sampling_summary = _summarize_loader_sampling(train_loader)
@@ -1445,6 +1578,7 @@ def _train_stage_loop(
                 device,
                 pos_weight,
                 concept_noise_std=concept_noise_std,
+                concept_noise_std_vector=concept_noise_std_vector,
                 label_loss_config=label_loss_config,
             )
             val_stats = _eval_stage2_epoch(
@@ -1456,16 +1590,34 @@ def _train_stage_loop(
                 threshold=threshold,
                 label_loss_config=label_loss_config,
             )
-            if np.isnan(float(val_stats["auc"])):
-                monitor_metric_name = "val_label_loss(fallback)"
-                monitor_metric_raw = float(val_stats["label_loss"])
+            stage2_monitor_metric = stage_monitor_metric or "label_loss"
+            val_auc = float(val_stats["auc"])
+            val_label_loss = float(val_stats["label_loss"])
+            if stage2_monitor_metric == "label_loss":
+                monitor_metric_name = "val_label_loss"
+                monitor_metric_raw = val_label_loss
                 selection_score = -monitor_metric_raw
                 scheduler_metric = selection_score
+                monitor_tie_break_name = "val_auc"
+                monitor_tie_break_raw = val_auc
+                tie_break_score = val_auc if np.isfinite(val_auc) else -float("inf")
             else:
-                monitor_metric_name = "val_auc"
-                monitor_metric_raw = float(val_stats["auc"])
-                selection_score = monitor_metric_raw
-                scheduler_metric = monitor_metric_raw
+                if np.isnan(val_auc):
+                    monitor_metric_name = "val_label_loss(fallback)"
+                    monitor_metric_raw = val_label_loss
+                    selection_score = -monitor_metric_raw
+                    scheduler_metric = selection_score
+                    monitor_tie_break_name = None
+                    monitor_tie_break_raw = None
+                    tie_break_score = -float("inf")
+                else:
+                    monitor_metric_name = "val_auc"
+                    monitor_metric_raw = val_auc
+                    selection_score = monitor_metric_raw
+                    scheduler_metric = monitor_metric_raw
+                    monitor_tie_break_name = "val_label_loss"
+                    monitor_tie_break_raw = val_label_loss
+                    tie_break_score = -val_label_loss
         else:
             train_stats = _train_stage3_epoch(
                 model,
@@ -1502,8 +1654,17 @@ def _train_stage_loop(
                 scheduler_metric = monitor_metric_raw
 
         improved = (selection_score - best_score) > float(early_stop_min_delta)
+        if (
+            not improved
+            and stage == "stage2"
+            and monitor_tie_break_name is not None
+            and abs(selection_score - best_score) <= float(early_stop_min_delta)
+            and tie_break_score > best_tie_break_score
+        ):
+            improved = True
         if improved:
             best_score = selection_score
+            best_tie_break_score = tie_break_score if stage == "stage2" else -float("inf")
             best_epoch = epoch
             no_improve = 0
             _save_checkpoint(
@@ -1539,15 +1700,27 @@ def _train_stage_loop(
             "train_pos_sampling_ratio": sampling_summary["pos_ratio"],
             "train_neg_sampling_ratio": sampling_summary["neg_ratio"],
         }
+        if stage == "stage2":
+            row["monitor_tie_break_name"] = monitor_tie_break_name
+            row["monitor_tie_break_raw"] = monitor_tie_break_raw
+            if concept_noise_summary is not None:
+                row["concept_noise_mode"] = concept_noise_summary.get("mode")
+                row["concept_noise_std_mean"] = concept_noise_summary.get("noise_std_mean", concept_noise_std)
+                row["concept_noise_std_min"] = concept_noise_summary.get("noise_std_min", concept_noise_std)
+                row["concept_noise_std_max"] = concept_noise_summary.get("noise_std_max", concept_noise_std)
         row.update({f"train_{k}": float(v) for k, v in train_stats.items()})
         row.update({f"val_{k}": float(v) for k, v in val_stats.items()})
         row.update(_get_current_lrs(optimizer))
         history.append(row)
 
         pos_weight_text = f"{effective_pos_weight_value:.4f}" if effective_pos_weight_value is not None else "disabled"
+        tie_break_text = ""
+        if stage == "stage2" and monitor_tie_break_name is not None and monitor_tie_break_raw is not None:
+            tie_break_text = f" tie={monitor_tie_break_name} raw={monitor_tie_break_raw:.6f}"
         print(
             f"[{stage}] epoch={epoch:03d} metric={monitor_metric_name} raw={monitor_metric_raw:.6f} "
             f"select={selection_score:.6f} best={best_score:.6f} improved={improved} "
+            f"{tie_break_text}"
             f"sampler={sampling_summary['sampler_type']} "
             f"pos_ratio={sampling_summary['pos_ratio']:.3f} "
             f"neg_ratio={sampling_summary['neg_ratio']:.3f} "
@@ -1659,12 +1832,6 @@ def main() -> None:
         train_shuffle=True,
         patient_balanced_sampling=bool(train_cfg.get("patient_balanced_sampling", False)),
     )
-    stage2_patient_dataloaders = _build_stage2_patient_dataloaders(
-        datasets=datasets,
-        batch_size=int(train_cfg.get("batch_size", 8)),
-        num_workers=int(train_cfg.get("num_workers", 4)),
-    )
-
     scaler: ConceptScaler = load_concept_scaler(concept_scaler_json)
     in_channels = int(model_cfg.get("in_channels", _compute_input_channels(data_cfg)))
     concept_dropout_p, label_dropout_p = _resolve_model_dropouts(model_cfg)
@@ -1721,9 +1888,22 @@ def main() -> None:
             _apply_encoder_freeze(model, stage_freeze_layer_names, stage="stage3")
 
         stage2_patient_level = bool(stage_cfg.get("patient_level", False))
+        stage2_concept_noise_mode = _normalize_key(stage_cfg.get("concept_noise_mode", "gaussian"))
+        if stage2_concept_noise_mode not in {"none", "off", "disabled", "gaussian", "residual"}:
+            raise ValueError(
+                f"Unsupported stages.{stage}.concept_noise_mode: {stage2_concept_noise_mode}. "
+                "Use one of: none, gaussian, residual."
+            )
         stage2_concept_noise_std = float(stage_cfg.get("concept_noise_std", 0.0))
+        stage2_concept_noise_min_std = float(stage_cfg.get("concept_noise_min_std", 0.0))
+        max_noise_raw = stage_cfg.get("concept_noise_max_std", None)
+        stage2_concept_noise_max_std = float(max_noise_raw) if max_noise_raw is not None else None
+        stage_batch_size = int(stage_cfg.get("batch_size", train_cfg.get("batch_size", 8)))
+        if stage_batch_size <= 0:
+            raise ValueError(f"stages.{stage}.batch_size must be positive, got {stage_batch_size}")
         if stage2_concept_noise_std < 0.0:
             raise ValueError(f"stages.{stage}.concept_noise_std must be >= 0, got {stage2_concept_noise_std}")
+        stage_monitor_metric = _resolve_stage_monitor_metric(stage_cfg, stage)
         stage_label_loss_cfg = _resolve_stage_label_loss_config(label_loss_cfg, stage_cfg, stage)
         stage_effective_loss_cfg = {
             "concept": dict(concept_loss_cfg),
@@ -1737,11 +1917,67 @@ def main() -> None:
         )
 
         if stage == "stage2" and stage2_patient_level:
+            stage2_patient_dataloaders = _build_stage2_patient_dataloaders(
+                datasets=datasets,
+                batch_size=stage_batch_size,
+                num_workers=int(train_cfg.get("num_workers", 4)),
+            )
             stage_train_loader = stage2_patient_dataloaders["train"]
             stage_val_loader = stage2_patient_dataloaders["val"]
+        elif stage_batch_size != int(train_cfg.get("batch_size", 8)):
+            stage_dataloaders = build_habitat_cbm_dataloaders(
+                datasets=datasets,
+                batch_size=stage_batch_size,
+                num_workers=int(train_cfg.get("num_workers", 4)),
+                train_shuffle=True,
+                patient_balanced_sampling=bool(train_cfg.get("patient_balanced_sampling", False)),
+            )
+            stage_train_loader = stage_dataloaders["train"]
+            stage_val_loader = stage_dataloaders["val"]
         else:
             stage_train_loader = dataloaders["train"]
             stage_val_loader = dataloaders["val"]
+
+        stage_concept_noise_std_vector: Optional[torch.Tensor] = None
+        stage_concept_noise_summary: Optional[Dict[str, object]] = None
+        if stage == "stage2":
+            if stage2_concept_noise_mode in {"none", "off", "disabled"} or stage2_concept_noise_std <= 0.0:
+                stage2_concept_noise_std = 0.0
+                stage_concept_noise_summary = {
+                    "mode": "disabled",
+                    "base_noise_std": float(stage2_concept_noise_std),
+                }
+            elif stage2_concept_noise_mode == "residual":
+                residual_loader = DataLoader(
+                    datasets["train"],
+                    batch_size=int(train_cfg.get("batch_size", 8)),
+                    shuffle=False,
+                    num_workers=int(train_cfg.get("num_workers", 4)),
+                    pin_memory=torch.cuda.is_available(),
+                )
+                stage_concept_noise_std_vector, stage_concept_noise_summary = _estimate_stage2_residual_noise_std(
+                    model=model,
+                    dataloader=residual_loader,
+                    device=device,
+                    base_noise_std=stage2_concept_noise_std,
+                    eval_transform=transform_map.get("val") if transform_map else None,
+                    min_noise_std=stage2_concept_noise_min_std,
+                    max_noise_std=stage2_concept_noise_max_std,
+                )
+                print(
+                    "[stage2] residual-aware concept noise std: "
+                    f"mean={stage_concept_noise_summary['noise_std_mean']:.6f} "
+                    f"min={stage_concept_noise_summary['noise_std_min']:.6f} "
+                    f"max={stage_concept_noise_summary['noise_std_max']:.6f}"
+                )
+            else:
+                stage_concept_noise_summary = {
+                    "mode": "gaussian",
+                    "base_noise_std": float(stage2_concept_noise_std),
+                    "noise_std_mean": float(stage2_concept_noise_std),
+                    "noise_std_min": float(stage2_concept_noise_std),
+                    "noise_std_max": float(stage2_concept_noise_std),
+                }
 
         stage_optimizer_cfg = {
             **optimizer_cfg,
@@ -1797,6 +2033,9 @@ def main() -> None:
             lambda_y=lambda_y,
             pos_weight=stage_effective_pos_weight,
             concept_noise_std=stage2_concept_noise_std,
+            concept_noise_std_vector=stage_concept_noise_std_vector,
+            concept_noise_summary=stage_concept_noise_summary,
+            stage_monitor_metric=stage_monitor_metric,
         )
 
         # 下一阶段从当前阶段最佳权重继续
@@ -1811,8 +2050,12 @@ def main() -> None:
             "optimizer": dict(stage_optimizer_cfg),
             "scheduler": dict(stage_scheduler_cfg),
             "scheduler_step_mode": scheduler_step_mode,
+            "batch_size": stage_batch_size,
             "stage2_patient_level": stage2_patient_level if stage == "stage2" else False,
+            "stage2_concept_noise_mode": stage2_concept_noise_mode if stage == "stage2" else "none",
             "stage2_concept_noise_std": stage2_concept_noise_std if stage == "stage2" else 0.0,
+            "stage2_concept_noise_summary": stage_concept_noise_summary if stage == "stage2" else None,
+            "stage_monitor_metric": stage_monitor_metric,
             "effective_pos_weight": float(stage_effective_pos_weight.item()) if stage_effective_pos_weight is not None else None,
             "label_loss_config": dict(stage_label_loss_cfg),
             "frozen_encoder_layers": stage_freeze_layer_names,
