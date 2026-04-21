@@ -1,6 +1,6 @@
 ---
 name: habitat-cbm-model
-updated: 2026-04-20
+updated: 2026-04-21
 description: Habitat-CBM 完整训练-评估-干预接口契约（JSON 配置驱动版）。
 ---
 
@@ -31,7 +31,7 @@ c_hat = concept_head(z)                  # [B, K]
 y_logit = linear(dropout(c_hat))         # [B, 1]
 ```
 
-其中 `K = len(selected_concepts)`；当前默认 `selected_concepts = [C1..C7]`，可选概念全集仍为 `C1..C8`。
+其中 `K = len(selected_concepts)`；当前默认 `selected_concepts = [C1, C2, C3, C4, C6]`，可选概念全集仍为 `C1..C8`。
 
 硬瓶颈约束：
 
@@ -80,7 +80,7 @@ y_logit = linear(dropout(c_hat))         # [B, 1]
 
 1. 患者 ID 全覆盖
 2. `label` 与 `concept_labels.csv:y_true` 一致
-3. 概念维度必须与 `selected_concepts` 一致（当前默认 `K=7`）
+3. 概念维度必须与 `selected_concepts` 一致（当前默认 `K=5`）
 4. scaler 统计合法（`std > 0`）
 
 ---
@@ -192,7 +192,7 @@ python habitat_CBM/repo/srcs/train_habitat_CBM.py \
 
 输入：`concept_proxy_features_<run_id>.csv`
 
-标签资产固定导出 `c1_true...c8_true` 全量列；训练/评估阶段可通过 `model.selected_concepts` 选择子集（当前默认 `C1..C7`）。输出：
+标签资产固定导出 `c1_true...c8_true` 全量列；训练/评估阶段可通过 `model.selected_concepts` 选择子集（当前默认 `C1/C2/C3/C4/C6`）。输出：
 
 1. `concept_labels.csv`
 2. `concept_statistics.csv`

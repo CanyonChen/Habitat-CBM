@@ -1,6 +1,6 @@
 ---
 name: user-guide-habitat-cbm
-updated: 2026-04-20
+updated: 2026-04-21
 description: Habitat-CBM 全流程使用说明（skill 风格）。面向用户与 LLM，覆盖概念标签构建、数据校验、三阶段训练、患者级评估、概念评估与概念干预。
 ---
 
@@ -17,7 +17,7 @@ description: Habitat-CBM 全流程使用说明（skill 风格）。面向用户�
 5. 概念层评估（`eval_habitat_cbm_concepts.py`）
 6. 患者级概念干预（`intervene_habitat_cbm.py`）
 
-本指南默认与当前实现（2026-04-18）一致，输出命名对齐 `lab_timeline.md` 与 `paper.md` 的证据链要求。
+本指南默认与当前实现（2026-04-21）一致，输出命名对齐 `lab_timeline.md` 与 `paper.md` 的证据链要求。
 
 ## Use This Guide When
 
@@ -121,12 +121,12 @@ python habitat_CBM/repo/srcs/build_habitat_cbm_labels.py \
   --std-floor 1e-6
 ```
 
-内置概念映射（源概念全集 8 维；当前默认训练子集为 `C1~C7`）：
+内置概念映射（源概念全集 8 维；当前默认训练子集为 reliability-filtered `C1,C2,C3,C4,C6`）：
 
 1. `c1 <- c1_h1_t1ce_firstorder_mean`
 2. `c2 <- c2_h23_t1ce_firstorder_mean`
 3. `c3 <- c3_whole_tumor_shape_sphericity`
-4. `c4 <- c4_whole_tumor_flair_ce_volume_ratio`
+4. `c4 <- c4_t2flair_voi_volume_log1p_cm3`
 5. `c5 <- c5_h12_adc_10percentile`
 6. `c6 <- c6_h1_cbf_95percentile`
 7. `c7 <- c7_h1_volume_ratio`
@@ -151,7 +151,7 @@ python habitat_CBM/repo/srcs/data_loader_habitat_CBM.py \
   --split-root habitat_CBM/dataset/splited_data/train \
   --concept-label-csv habitat_CBM/results/02_habitat/concept_labels.csv \
   --concept-scaler-json habitat_CBM/results/03_habitat_cbm/concept_scaler_stats.json \
-  --selected-concepts C1,C2,C3,C4,C5,C6,C7 \
+  --selected-concepts C1,C2,C3,C4,C6 \
   --block-depth 5 \
   --max-samples 3
 ```
@@ -166,7 +166,7 @@ python habitat_CBM/repo/srcs/data_loader_habitat_CBM.py \
 1. `dataset` 中所有 `patient_id` 必须在 `concept_labels.csv` 中存在。
 2. `dataset label` 必须与 `concept_labels.csv:y_true` 一致。
 3. split 必须一致（例如 train split 不可映射到 val 标签）。
-4. 概念维度必须与 `selected_concepts` 长度一致；当前默认 `K=7`，可选全集为 `C1~C8`。
+4. 概念维度必须与 `selected_concepts` 长度一致；当前默认 `K=5`，可选全集为 `C1~C8`。
 5. scaler 中每个概念 `std > 0`。
 
 ### Step 3: Train Habitat-CBM (Stage1 -> Stage2 -> Stage3)
@@ -365,8 +365,8 @@ python habitat_CBM/repo/srcs/intervene_habitat_cbm.py \
 ### model
 
 1. `in_channels`
-2. `selected_concepts`（默认 `C1~C7`，可选全集 `C1~C8`）
-3. `n_concepts`（必须等于 `selected_concepts` 的长度；当前默认 7）
+2. `selected_concepts`（默认 `C1,C2,C3,C4,C6`，可选全集 `C1~C8`）
+3. `n_concepts`（必须等于 `selected_concepts` 的长度；当前默认 5）
 4. `concept_hidden_dim`
 5. `label_hidden_dim`（兼容旧配置保留字段，当前单层 `label_head` 不再实际使用）
 6. `concept_dropout_p` / `label_dropout_p`

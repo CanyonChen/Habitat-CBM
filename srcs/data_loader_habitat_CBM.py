@@ -38,7 +38,9 @@ from srcs.data_loader import (
 )
 
 AVAILABLE_CONCEPT_NAMES = tuple(f"c{i}" for i in range(1, 9))
-DEFAULT_CONCEPT_NAMES = tuple(f"c{i}" for i in range(1, 8))
+# Reliability-filtered default subset: keep concepts that are both useful for
+# IDH prediction and reasonably learnable from image blocks.
+DEFAULT_CONCEPT_NAMES = ("c1", "c2", "c3", "c4", "c6")
 DEFAULT_CONCEPT_COLUMNS = tuple(f"{name}_true" for name in DEFAULT_CONCEPT_NAMES)
 
 
@@ -566,7 +568,7 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--selected-concepts",
         type=str,
         default=None,
-        help="Comma-separated concept ids, e.g. C1,C2,C3",
+        help="Comma-separated concept ids, e.g. C1,C2,C3,C4,C6",
     )
     parser.add_argument("--max-samples", type=int, default=3)
     return parser

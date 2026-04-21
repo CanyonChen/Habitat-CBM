@@ -1035,8 +1035,8 @@ python habitat_CBM/repo/srcs/train_habitat_CBM.py --stage stage2
 # 随机张量自检
 python habitat_CBM/repo/srcs/eval_habitat_CBM.py --k 2
 
-# 预算为全部概念（默认 n_concepts=8）
-python habitat_CBM/repo/srcs/eval_habitat_CBM.py --k 8
+# 预算为全部概念（当前默认 n_concepts=5）
+python habitat_CBM/repo/srcs/eval_habitat_CBM.py --k 5
 ```
 
 ### 干预策略说明

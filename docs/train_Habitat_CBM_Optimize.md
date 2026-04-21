@@ -19,12 +19,13 @@
 ```
 x [B, 35, 224, 224]
   └─ encoder: ResNet18Backbone → z [B, 512]
-       └─ concept_head: Linear(512→256)→ReLU→Dropout→Linear(256→8) → c_hat [B, 8]
-            └─ label_head: Linear(8→32)→ReLU→Dropout→Linear(32→1) → y_logit [B, 1]
+       └─ concept_head: Linear(512→256)→ReLU→Dropout→Linear(256→K) → c_hat [B, K]
+            └─ label_head: Dropout→Linear(K→1) → y_logit [B, 1]
 ```
 
 - **硬瓶颈（Hard Bottleneck）**：`y_logit` 仅依赖 `c_hat`，不能绕过概念层。
-- **概念维度**：8 个连续概念（c1–c8），由 `build_habitat_cbm_labels.py` 生成的患者级 raw 概念标准化而来。
+- **候选概念全集**：`build_habitat_cbm_labels.py` 生成 C1–C8 的患者级 raw 概念与标准化统计。
+- **当前默认概念子集**：Reliability-Filtered 5-Concept CBM，使用 `C1/C2/C3/C4/C6`，即 `K=5`。
 - **预测目标**：`c_hat` 回归标准化概念值（`concept_true_std`）；`y_logit` 做 IDH 二分类。
 
 ### 1.3 三阶段训练协议
@@ -35,7 +36,7 @@ x [B, 35, 224, 224]
 | Stage2 | encoder + concept_head | label_head | BCE（使用真实概念 `c_true_std`） | `-val_label_loss`（主监控） + `val_auc`（tie-break） |
 | Stage3 | 浅层 encoder（可配置） | layer4 + concept_head + label_head | `λ_c × concept_loss + λ_y × label_loss` | `val_auc` |
 
-> **Stage3 冻结说明**：Stage3 默认冻结 `conv1/bn1/layer1/layer2/layer3`，与 Stage1 行为对称，防止联合微调时浅层特征大幅偏移。可通过 `stages.stage3.freeze_encoder_layers` 参数化控制。
+> **Stage3 冻结说明**：Stage3 默认冻结 `layer1/layer2/layer3`，保留输入适配层和高层语义层的小步更新能力。可通过 `stages.stage3.freeze_encoder_layers` 参数化控制。
 
 ---
 
@@ -73,7 +74,7 @@ x [B, 35, 224, 224]
 ### 2.4 Stage2 Oracle 性能
 
 Stage2 使用真实概念标签输入（oracle 模式），val AUC 达 **0.896**。
-这证明：8 个概念本身含有足够的 IDH 分类信息，当前性能瓶颈在于**概念预测精度不足**，而非 label_head 能力。
+这证明：候选概念本身含有足够的 IDH 分类信息，当前性能瓶颈在于**概念预测精度不足和概念子集可靠性不足**，而非 label_head 能力。
 
 ---
 
@@ -83,17 +84,18 @@ Stage2 使用真实概念标签输入（oracle 模式），val AUC 达 **0.896**
 
 | 编号 | 优化项 | 状态 | 当前默认值 | 代码入口 |
 |------|--------|------|-----------|---------|
-| OPT-1 | Stage3 学习率修复 | ✅ 已实现 | `stages.stage3.optimizer`: `lr=5e-6`，`lr_encoder=5e-6`，`lr_concept_head=1e-5`，`lr_label_head=5e-6` | `args_train_habitat_CBM.json` |
+| OPT-1 | Stage3 学习率修复 | ✅ 已实现 | `stages.stage3.optimizer`: `lr=1e-5`，`lr_encoder=3e-6`，`lr_concept_head=8e-6`，`lr_label_head=3e-5` | `args_train_habitat_CBM.json` |
 | OPT-2 | Stage3 loss 权重调整 | ✅ 已实现 | `loss.joint`: `lambda_c=0.5`，`lambda_y=1.0` | `args_train_habitat_CBM.json` |
 | OPT-3 | 阈值：val Youden Index 动态选取 | ✅ 已实现 | 训练期监控用 `eval.threshold=0.5`；最终评估用 val 集 Youden Index 动态阈值 | `train_habitat_CBM.py` |
 | OPT-5 | pos_weight 自动计算（不再手动固定） | ✅ 已实现 | `manual_pos_weight=null`，自动计算 `N_neg/N_pos ≈ 1.53` | `args_train_habitat_CBM.json` |
 | OPT-6 | Stage1 调度器优化 | ✅ 已实现 | `stages.stage1.scheduler`: `factor=0.3`，`patience=3` | `args_train_habitat_CBM.json` |
-| OPT-7 | 放宽早停 | ✅ 已实现 | `early_stop_patience=20`，`early_stop_min_delta=0.002` | `args_train_habitat_CBM.json` |
+| OPT-7 | 放宽早停 | ✅ 已实现 | `early_stop_patience=100`，`early_stop_min_delta=0.002` | `args_train_habitat_CBM.json` |
 | OPT-8 | 患者均衡采样 | ✅ 已实现 | `train.patient_balanced_sampling=true`，使用 `WeightedRandomSampler` | `data_loader_habitat_CBM.py` |
-| OPT-9 | Stage2 患者级 + 残差感知概念噪声（A+B） | ✅ 已实现 | `stages.stage2.patient_level=true`，`concept_noise_mode=residual`，`concept_noise_std=0.1` | `data_loader_habitat_CBM.py` + `train_habitat_CBM.py` |
+| OPT-9 | Stage2 患者级 + 残差感知概念噪声（A+B） | ✅ 已实现 | `stages.stage2.patient_level=true`，`concept_noise_mode=residual`，`concept_noise_std=0.08` | `data_loader_habitat_CBM.py` + `train_habitat_CBM.py` |
 | OPT-11 | 更鲁棒概念 loss | ✅ 已实现 | `loss.concept.name=smooth_l1`，`beta=0.5` | `args_train_habitat_CBM.json` |
-| NEW-1 | Stage3 encoder 冻结层参数化 | ✅ 已实现 | `stages.stage3.freeze_encoder_layers=["conv1","bn1","layer1","layer2","layer3"]` | `args_train_habitat_CBM.json` + `train_habitat_CBM.py` |
+| NEW-1 | Stage3 encoder 冻结层参数化 | ✅ 已实现 | `stages.stage3.freeze_encoder_layers=["layer1","layer2","layer3"]` | `args_train_habitat_CBM.json` + `train_habitat_CBM.py` |
 | NEW-2 | PNG 结果图导出 | ✅ 已实现 | `eval.export_png=true`，`figure_dpi=300` | `eval_habitat_CBM.py` |
+| NEW-3 | Reliability-Filtered 5-Concept CBM | ✅ 已配置 | `selected_concepts=["C1","C2","C3","C4","C6"]`，`n_concepts=5` | `args_train_habitat_CBM.json` + `data_loader_habitat_CBM.py` |
 
 ---
 
@@ -117,14 +119,15 @@ Stage2 使用真实概念标签输入（oracle 模式），val AUC 达 **0.896**
 ### 问题 C：概念预测泛化不足（Val concept_loss=0.616）
 
 **根因分析：**
-1. `dropout_p=0.7` 过高，影响概念预测的稳定性（训练时 70% 神经元随机失活，对小样本可能过于激进）。
+1. 旧配置 `concept_dropout_p=0.7` 过高，影响概念预测的稳定性（训练时 70% 神经元随机失活，对小样本可能过于激进）。
 2. Stage1 仅 14 epoch 就早停，概念 head 尚未充分收敛。
 3. 96 例训练患者规模较小，对概念回归的泛化要求较高。
+4. 20260420_233633 的逐概念诊断显示，部分概念在 test split 上 `X→C` 相关性偏弱，尤其 C7 预测不稳定；若继续放入硬瓶颈，会污染 `C→Y` 的可解释性和泛化。
 
 ### 问题 D：block 级训练与患者级标签存在权重错配
 
 **根因分析：**
-1. 当前 Dataset 将每位患者展开成多个 2.5D block，但 IDH 标签和 8 维概念标签都是患者级标签，会复制到该患者的所有 block。
+1. 当前 Dataset 将每位患者展开成多个 2.5D block，但 IDH 标签和候选概念标签都是患者级标签，会复制到该患者的所有 block。
 2. `pos_weight` 按训练集患者数计算，但 BCE 实际按 block 聚合。若不同类别或不同患者的有效 block 数不均衡，患者级 `pos_weight` 不能完全修正 block 级训练偏置。
 3. Stage2 用真实概念训练 label_head 时，理论上只有 96 个唯一训练点，但脚本会按 block 重复同一患者概念，等价于按患者 block 数给 `C→Y` 样本加权，容易让 label_head 过快过拟合。
 
@@ -165,11 +168,11 @@ Stage2 使用真实概念标签输入（oracle 模式），val AUC 达 **0.896**
 "stage3": {
   "optimizer": {
     "name": "adamw",
-    "lr": 0.000005,
-    "lr_encoder": 0.000005,
-    "lr_concept_head": 0.00001,
-    "lr_label_head": 0.000005,
-    "weight_decay": 0.01,
+    "lr": 0.00001,
+    "lr_encoder": 0.000003,
+    "lr_concept_head": 0.000008,
+    "lr_label_head": 0.00003,
+    "weight_decay": 0.005,
     "betas": [0.9, 0.999],
     "eps": 1e-08,
     "amsgrad": false
@@ -178,8 +181,8 @@ Stage2 使用真实概念标签输入（oracle 模式），val AUC 达 **0.896**
 ```
 
 **说明**：
-- `lr_encoder` 设为 5e-6，比 concept/label head 更小，保护 encoder 已学到的特征表示不被破坏。
-- `lr_concept_head` 降至 1e-5，`lr_label_head` 降至 5e-6，小步更新，微调而非重训。
+- `lr_encoder` 设为 3e-6，比 concept/label head 更小，保护 encoder 已学到的特征表示不被破坏。
+- `lr_concept_head=8e-6` 保持概念层小步更新；`lr_label_head=3e-5` 允许单层分类头更积极适配 joint fine-tune。
 
 ---
 
@@ -231,12 +234,53 @@ Stage2 使用真实概念标签输入（oracle 模式），val AUC 达 **0.896**
 
 **目标**：改善概念预测泛化，减少 Stage1 概念 loss 的不稳定性。
 
-**当前配置**：`model.dropout_p = 0.4`（已从基准 0.7 降低）
+**实现状态**：✅ **已配置**。
+
+**当前配置**：
+
+```json
+"model": {
+  "concept_dropout_p": 0.4,
+  "label_dropout_p": 0.1
+}
+```
 
 **说明**：
-- 0.4–0.5 是标准小样本场景的常用值，在正则化强度和表达能力之间取得平衡。
+- `concept_dropout_p` 从旧配置 0.7 降到 0.4，避免概念回归端过强随机失活。
+- `label_dropout_p` 从 0.15 降到 0.1，配合 5 概念输入减少有效信号丢失。
 - 如果降低后验证集概念 loss 仍不改善，可进一步尝试 0.3。
 - 此改动需要重新从 Stage1 开始训练。
+
+---
+
+### 新增 NEW-3：Reliability-Filtered 5-Concept CBM（**高优先级**）
+
+**目标**：从候选概念全集中保留既有 IDH 判别信息、又能从影像稳定预测的概念，降低硬瓶颈中的噪声概念污染。
+
+**实现状态**：✅ **已配置为当前默认实验**。
+
+**当前配置**（`model`）：
+
+```json
+"model": {
+  "selected_concepts": ["C1", "C2", "C3", "C4", "C6"],
+  "n_concepts": 5,
+  "concept_hidden_dim": 256,
+  "concept_dropout_p": 0.4,
+  "label_dropout_p": 0.1
+}
+```
+
+**筛选依据**：
+- 保留 `C1/C2/C3/C4/C6`：它们在 20260420_233633 中仍有可用的概念预测信号或稳定的 IDH 判别贡献。
+- 暂时移除 `C7`：test split 上 `c7_pred_std` 与 `c7_true_std` 相关性过低，容易破坏概念层忠实性。
+- 暂时移除 `C5`：相对贡献和稳定性不如保留概念，先降低瓶颈学习难度。
+
+**评估标准**：
+- test AUC 尽量保持在 `0.88+`。
+- val/test 平均 `abs_error_std` 低于 7 概念版本的约 `0.66`。
+- 每个保留概念同时报告 MAE、Pearson/Spearman、true/pred class separation。
+- 若分类性能接近 7 概念版本但概念指标改善，应优先采用 5 概念版本作为论文主 CBM。
 
 ---
 
@@ -288,12 +332,13 @@ Stage2 使用真实概念标签输入（oracle 模式），val AUC 达 **0.896**
 
 ```json
 "stage1": {
+  "freeze_encoder_layers": ["layer1", "layer2"],
   "optimizer": {
     "name": "adamw",
     "lr": 0.00003,
-    "lr_encoder": 0.00003,
-    "lr_concept_head": 0.00003,
-    "weight_decay": 0.01,
+    "lr_encoder": 0.00002,
+    "lr_concept_head": 0.00005,
+    "weight_decay": 0.005,
     "betas": [0.9, 0.999],
     "eps": 1e-08,
     "amsgrad": false
@@ -311,6 +356,7 @@ Stage2 使用真实概念标签输入（oracle 模式），val AUC 达 **0.896**
 
 **说明**：
 - **初始 lr 从 1e-4 降至 3e-5**（降低 3 倍）：直接减小每次更新步长，消除因步长过大导致的 val loss 跳动。
+- 当前 5 概念实验对 Stage1 做了小幅放松：冻结 `layer1/layer2`，解冻 `layer3/layer4`，并将 `lr_concept_head` 提高到 `5e-5`，让高层影像特征更充分适配可靠概念子集。
 - `factor=0.3`（原 0.5）：触发衰减时 lr 降得更快（3e-5 → 9e-6 → 2.7e-6），越早进入细粒度搜索。
 - `patience=3`（原 5）：减少假新低对 patience 计数器的重置窗口，更快触发 lr 衰减。
 - 预期效果：val concept_loss 曲线从震荡形态变为单调下降或平台形态，最优 val concept_loss 有望低于基准的 0.616。
@@ -327,7 +373,7 @@ Stage2 使用真实概念标签输入（oracle 模式），val AUC 达 **0.896**
 
 ```json
 "train": {
-  "early_stop_patience": 20,
+  "early_stop_patience": 100,
   "early_stop_min_delta": 0.002
 }
 ```
@@ -377,7 +423,7 @@ Stage2 使用真实概念标签输入（oracle 模式），val AUC 达 **0.896**
   "patient_level": true,
   "monitor_metric": "label_loss",
   "concept_noise_mode": "residual",
-  "concept_noise_std": 0.1,
+  "concept_noise_std": 0.08,
   "concept_noise_min_std": 0.02,
   "concept_noise_max_std": null
 }
@@ -456,14 +502,14 @@ Stage2 使用真实概念标签输入（oracle 模式），val AUC 达 **0.896**
 
 ```json
 "stage3": {
-  "freeze_encoder_layers": ["conv1", "bn1", "layer1", "layer2", "layer3"]
+  "freeze_encoder_layers": ["layer1", "layer2", "layer3"]
 }
 ```
 
 **说明**：
 - 可用层名与 Stage1 完全相同：`conv1`、`bn1`、`layer1`、`layer2`、`layer3`、`layer4`。
 - 设为 `null` 或 `[]` 表示 Stage3 全量解冻（原始行为）。
-- 默认值冻结浅层 5 层，只允许 `layer4` + `concept_head` + `label_head` 参与 Stage3 微调，避免浅层通用特征被破坏。
+- 当前默认冻结 `layer1/layer2/layer3`，保留 `conv1/bn1` 的 35 通道输入适配能力，并允许 `layer4` + `concept_head` + `label_head` 参与 Stage3 微调。
 - 代码在 `train_habitat_CBM.py` 的通用函数 `_apply_encoder_freeze(model, freeze_layer_names, stage)` 中实现，Stage1 和 Stage3 均调用该函数，日志分别打印 `[stage1]` 和 `[stage3]` 前缀。
 
 ---
@@ -564,7 +610,10 @@ Run F     OPT-8 均衡采样（已默认生效）           Train/Val loss gap �
 Run G     OPT-9（已默认生效 A+B）               Stage2 oracle 到 Stage3 的性能落差是否缩小；
           患者级 Stage2 + 概念噪声               Stage3 label_loss 是否下降
 
-Run H     最优配置做 OPT-13（多 seed/CV）        Val/CV mean±std 是否优于基准；
+Run H     NEW-3（当前默认 5 概念）              Test AUC 是否保持 0.88+；
+          Reliability-Filtered 子集             Val/Test concept MAE/corr 是否改善
+
+Run I     最优配置做 OPT-13（多 seed/CV）        Val/CV mean±std 是否优于基准；
                                                最终 test 是否同步提升
 ─────────────────────────────────────────────────────────────────────
 ```
@@ -572,7 +621,7 @@ Run H     最优配置做 OPT-13（多 seed/CV）        Val/CV mean±std 是否
 **推荐执行原则**：
 - Run A–C 的改动已全部内置为默认值，直接运行即可观察效果。
 - 如果概念 loss 仍高，再做 Run D/E，集中优化 `X→C`。
-- Run F/G 相关代码已落地，可直接做对照实验验证收益。
+- Run H 是当前建议直接启动的下一轮主实验；除 5 概念子集和 Stage1/dropout 调整外，暂不同时改弱增强或 top-k pooling，便于归因。
 
 ---
 
@@ -587,25 +636,31 @@ Run H     最优配置做 OPT-13（多 seed/CV）        Val/CV mean±std 是否
 | `loss.concept.name` | mse | **smooth_l1** | ✅ 已生效 | 降低异常概念影响 |
 | `loss.concept.beta` | *(无)* | **0.5** | ✅ 已生效 | SmoothL1 转折点 |
 | `loss.label.manual_pos_weight` | 2.5 | **null（自动）** | ✅ 已生效 | 避免过度强调正类 |
+| `model.selected_concepts` | 全候选 / 旧 7 概念 | **["C1","C2","C3","C4","C6"]** | ✅ 已配置 | 可靠概念子集 |
+| `model.n_concepts` | 8 / 7 | **5** | ✅ 已配置 | 降低瓶颈噪声 |
+| `model.concept_dropout_p` | 0.7 | **0.4** | ✅ 已配置 | 概念预测泛化 |
+| `model.label_dropout_p` | 0.15 | **0.1** | ✅ 已配置 | 减少概念信号丢失 |
 | `stages.stage1.optimizer.lr` | *(继承全局 1e-4)* | **3e-5** | ✅ 已生效 | 消除 Stage1 震荡 |
+| `stages.stage1.optimizer.lr_encoder` | *(继承全局 1e-4)* | **2e-5** | ✅ 已配置 | 小步适配高层特征 |
+| `stages.stage1.optimizer.lr_concept_head` | *(继承全局 1e-4)* | **5e-5** | ✅ 已配置 | 加强 5 概念收敛 |
+| `stages.stage1.optimizer.weight_decay` | 0.01 | **0.005** | ✅ 已配置 | 减轻概念头欠拟合 |
 | `stages.stage1.scheduler.factor` | *(继承全局 0.5)* | **0.3** | ✅ 已生效 | Stage1 快速降 lr |
 | `stages.stage1.scheduler.patience` | *(继承全局 5)* | **3** | ✅ 已生效 | 减少假新低重置 |
-| `stages.stage1.freeze_encoder_layers` | *(无)* | **["conv1","bn1","layer1","layer2","layer3"]** | ✅ 已生效 | 抑制浅层过拟合 |
-| `stages.stage3.optimizer.lr` | *(继承全局 1e-4)* | **5e-6** | ✅ 已生效 | Stage3 不偏移 |
-| `stages.stage3.optimizer.lr_encoder` | *(继承全局 1e-4)* | **5e-6** | ✅ 已生效 | 保护 encoder |
-| `stages.stage3.optimizer.lr_concept_head` | *(继承全局 1e-4)* | **1e-5** | ✅ 已生效 | 小步更新概念层 |
-| `stages.stage3.optimizer.lr_label_head` | *(继承全局 1e-4)* | **5e-6** | ✅ 已生效 | 小步更新分类头 |
-| `stages.stage3.freeze_encoder_layers` | *(无，全解冻)* | **["conv1","bn1","layer1","layer2","layer3"]** | ✅ 已生效 | 防止浅层偏移 |
+| `stages.stage1.freeze_encoder_layers` | *(无)* | **["layer1","layer2"]** | ✅ 已配置 | 允许高层适配 5 概念 |
+| `stages.stage3.optimizer.lr` | *(继承全局 1e-4)* | **1e-5** | ✅ 已生效 | Stage3 不偏移 |
+| `stages.stage3.optimizer.lr_encoder` | *(继承全局 1e-4)* | **3e-6** | ✅ 已生效 | 保护 encoder |
+| `stages.stage3.optimizer.lr_concept_head` | *(继承全局 1e-4)* | **8e-6** | ✅ 已生效 | 小步更新概念层 |
+| `stages.stage3.optimizer.lr_label_head` | *(继承全局 1e-4)* | **3e-5** | ✅ 已生效 | 分类头适配 joint fine-tune |
+| `stages.stage3.freeze_encoder_layers` | *(无，全解冻)* | **["layer1","layer2","layer3"]** | ✅ 已生效 | 防止浅层偏移 |
 | `stages.stage2.patient_level` | *(不支持)* | **true** | ✅ 已生效 | Stage2 去 block 重复 |
 | `stages.stage2.concept_noise_mode` | *(不支持)* | **residual** | ✅ 已生效 | 用 Stage1 残差估计逐概念噪声 |
-| `stages.stage2.concept_noise_std` | *(不支持)* | **0.1** | ✅ 已生效 | residual 模式下的平均噪声强度 |
-| `train.early_stop_patience` | 10 | **20** | ✅ 已生效 | 给 LR 衰减留出训练窗口 |
+| `stages.stage2.concept_noise_std` | *(不支持)* | **0.08** | ✅ 已生效 | residual 模式下的平均噪声强度 |
+| `train.early_stop_patience` | 10 | **100** | ✅ 已生效 | 给 LR 衰减留出训练窗口 |
 | `train.early_stop_min_delta` | 0.0 | **0.002** | ✅ 已生效 | 过滤小幅随机波动 |
 | `train.patient_balanced_sampling` | *(不支持)* | **true** | ✅ 已生效 | 患者级梯度均衡 |
 | `eval.threshold` | 0.4 | **0.5（训练期监控）** | ✅ 已生效 | 训练期中性阈值 |
 | 最终评估阈值 | 固定 0.4 | **val 集 Youden Index 动态** | ✅ 已生效 | 自适应提升 Sen |
 | `eval.topk_pool` | 0 | **0** | ⏳ 可扫描 | 优化患者级聚合 |
-| `model.dropout_p` | 0.7 | **0.4** | ⏳ 建议验证 | 概念预测泛化 |
 | `train.aug_rotate_deg` | 30.0 | 30.0（待调） | ⏳ 可尝试 10.0 | 减少空间标签噪声 |
 | `train.aug_gibbs_noise_prob` | 0.3 | 0.3（待调） | ⏳ 可尝试关闭 | 先关闭强伪影增强 |
 
@@ -744,7 +799,7 @@ c_pred_vs_true_spearman
 
 1. **模型结构不变**：本轮优先优化不修改 `habitat_CBM.py` 中的网络结构（encoder/concept_head/label_head 的层数和维度）。所有高优先级变动优先通过配置文件或训练脚本的少量修改实现。
 2. **三阶段协议不变**：Stage1→2→3 的训练顺序和各阶段的冻结策略保持不变。Stage3 的浅层冻结通过 `freeze_encoder_layers` 参数化控制，默认行为等价于冻结前 5 层。
-3. **概念维度不变**：`n_concepts=8`，与现有 `concept_labels.csv` 保持一致，不重新生成概念标签。
+3. **候选概念资产不变**：`concept_labels.csv` 仍保留 C1–C8 全量列，不需要重新生成概念标签；训练默认通过 `model.selected_concepts=["C1","C2","C3","C4","C6"]` 选择 5 维可靠子集。
 4. **数据划分不变**：Train/Val/Test 的患者分配不变，保证结果可与基准实验（`20260419_155537`）直接对比。
 5. **`args_train_habitat_CBM.json` 的 `_comment` 字段**：所有 `_comment_*` 字段是合法 JSON 注释字段，训练脚本会忽略它们，修改时保留这些注释字段。
 6. **Stage optimizer 覆盖格式**：`stages.stage1/stage3.optimizer` 使用与全局 `optimizer` 相同的扁平 key；训练脚本会做浅层合并，缺失的 key 自动回退到全局配置。
@@ -753,4 +808,4 @@ c_pred_vs_true_spearman
 
 ---
 
-*文档更新时间：2026-04-19（覆盖 OPT-1/2/3/5/6/7/8/9/11 + NEW-1 Stage3 冻结参数化 + NEW-2 PNG 导出） | 基准实验 run_id：20260419_155537*
+*文档更新时间：2026-04-21（覆盖 OPT-1/2/3/4/5/6/7/8/9/11 + NEW-1 Stage3 冻结参数化 + NEW-2 PNG 导出 + NEW-3 Reliability-Filtered 5-Concept CBM） | 基准实验 run_id：20260419_155537 | 最新诊断 run_id：20260420_233633*

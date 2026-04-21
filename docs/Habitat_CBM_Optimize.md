@@ -6,6 +6,8 @@ description: 历史版 Habitat-CBM 优化诊断与实现路线记录；当前实
 # Habitat-CBM 优化诊断 Skill
 
 > 更新说明（2026-04-20）：本文档保留了 Habitat-CBM 从“仅有骨架与工具函数”走向完整闭环的历史诊断过程。文中的 blocker、缺失项和部分“当前实现”表述对应的是早期阶段，不再等同于当前代码状态。当前实现请优先参考 `docs/user_guide_Habitat_CBM.md` 与 `docs/habitat_CBM_model.md`。
+>
+> 当前默认实验说明（2026-04-21）：训练配置已切换为 Reliability-Filtered 5-Concept CBM，默认使用 `C1/C2/C3/C4/C6`。本文档中“8 个概念”的表述主要指候选概念资产全集 C1–C8 或历史论文证据链要求，不代表当前默认训练瓶颈维度。
 
 ## Overview
 

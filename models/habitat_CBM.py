@@ -78,7 +78,7 @@ class HabitatCBM(nn.Module):
     def __init__(
         self,
         in_channels: int,
-        n_concepts: int = 8,
+        n_concepts: int = 5,
         concept_hidden_dim: int = 256,
         label_hidden_dim: int = 32,
         dropout_p: float | None = None,
@@ -181,7 +181,7 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     model = HabitatCBM(
         in_channels=35,
-        n_concepts=8,
+        n_concepts=5,
         concept_hidden_dim=256,
         label_hidden_dim=32,
         concept_dropout_p=0.3,
