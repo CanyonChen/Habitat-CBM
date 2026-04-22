@@ -7,6 +7,7 @@ Habitat-CBM 三阶段训练主脚本。
 1. JSON 主配置 + CLI 覆盖；
 2. Stage1/Stage2/Stage3 完整训练与早停；
 3. stage1_best.pt / stage2_best.pt / stage3_best.pt + 分阶段日志导出；
+   Stage3 可配置为 stage3a(label-head adaptation) -> stage3b(joint fine-tune)；
 4. 训练完成后自动执行患者级评估导出。
 """
 
@@ -57,9 +58,10 @@ from srcs.data_loader_habitat_CBM import (
 from srcs.eval_habitat_CBM import run_full_evaluation
 from srcs.monai_augmentation import MonaiAugmentConfig, build_monai_block_transforms
 
-TrainStage = Literal["stage1", "stage2", "stage3"]
+TrainStage = Literal["stage1", "stage2", "stage3", "stage3a", "stage3b"]
 SchedulerStepMode = Literal["none", "epoch", "metric"]
 MODEL_NAME = "habitat_cbm"
+_STAGE3_VARIANTS = {"stage3", "stage3a", "stage3b"}
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,10 @@ def _normalize_key(value: object) -> str:
     return str(value).strip().lower().replace("-", "_").replace(" ", "_")
 
 
+def _is_stage3_variant(stage: str) -> bool:
+    return stage in _STAGE3_VARIANTS
+
+
 def _optional_path(value: object) -> Optional[Path]:
     if value is None:
         return None
@@ -142,6 +148,14 @@ def normalize_stage_name(stage: str) -> TrainStage:
         "labelhead": "stage2",
         "3": "stage3",
         "stage3": "stage3",
+        "stage3a": "stage3a",
+        "stage3alabeladapt": "stage3a",
+        "stage3labeladapt": "stage3a",
+        "labeladapt": "stage3a",
+        "predictedconceptadapt": "stage3a",
+        "stage3b": "stage3b",
+        "stage3bjoint": "stage3b",
+        "stage3joint": "stage3b",
         "joint": "stage3",
         "jointfinetune": "stage3",
     }
@@ -228,6 +242,10 @@ def set_train_stage(model: HabitatCBM, stage: str) -> TrainStage:
         _set_requires_grad(model.concept_head, True)
         _set_requires_grad(model.label_head, False)
     elif stage_name == "stage2":
+        _set_requires_grad(model.encoder, False)
+        _set_requires_grad(model.concept_head, False)
+        _set_requires_grad(model.label_head, True)
+    elif stage_name == "stage3a":
         _set_requires_grad(model.encoder, False)
         _set_requires_grad(model.concept_head, False)
         _set_requires_grad(model.label_head, True)
@@ -722,6 +740,18 @@ def _resolve_stage_label_loss_config(
     return resolved
 
 
+def _resolve_stage_joint_loss_config(
+    base_joint_loss_cfg: Mapping[str, object],
+    stage_cfg: Mapping[str, object],
+    stage: TrainStage,
+) -> Dict[str, object]:
+    stage_override = _as_mapping(stage_cfg.get("joint_loss", {}), name=f"stages.{stage}.joint_loss")
+    resolved = {**base_joint_loss_cfg, **stage_override}
+    resolved.setdefault("lambda_c", 0.5)
+    resolved.setdefault("lambda_y", 1.0)
+    return resolved
+
+
 def _resolve_stage_monitor_metric(
     stage_cfg: Mapping[str, object],
     stage: TrainStage,
@@ -993,6 +1023,14 @@ def _apply_cli_overrides(cfg: Dict[str, object], args: argparse.Namespace) -> Di
         train_cfg["epochs_stage3"] = int(args.epochs_stage3)
         stage3_cfg = _as_mapping(stages_cfg.get("stage3", {}), name="stages.stage3")
         stage3_cfg["epochs"] = int(args.epochs_stage3)
+        for substage_name in ("step_a", "step_b"):
+            if substage_name in stage3_cfg:
+                substage_cfg = _as_mapping(
+                    stage3_cfg.get(substage_name, {}),
+                    name=f"stages.stage3.{substage_name}",
+                )
+                substage_cfg["epochs"] = int(args.epochs_stage3)
+                stage3_cfg[substage_name] = substage_cfg
         stages_cfg["stage3"] = stage3_cfg
     if args.batch_size is not None:
         train_cfg["batch_size"] = int(args.batch_size)
@@ -1040,24 +1078,59 @@ def _build_stage_configs(
         "stage1": ("epochs_stage1", "stage1_best.pt", "stage1_concept_log.csv"),
         "stage2": ("epochs_stage2", "stage2_best.pt", "stage2_label_head_log.csv"),
         "stage3": ("epochs_stage3", "stage3_best.pt", "stage3_joint_log.csv"),
+        "stage3a": ("epochs_stage3", "stage3a_label_adapt_best.pt", "stage3a_label_adapt_log.csv"),
+        "stage3b": ("epochs_stage3", "stage3_best.pt", "stage3_joint_log.csv"),
     }
 
     stage_items: List[Tuple[TrainStage, int, Path, Path, Dict[str, object]]] = []
-    for stage in ("stage1", "stage2", "stage3"):
-        stage_cfg = _as_mapping(stages_cfg.get(stage, {}), name=f"stages.{stage}")
+
+    def add_stage(
+        stage: TrainStage,
+        stage_cfg: Mapping[str, object],
+        *,
+        default_epochs: int,
+    ) -> None:
+        stage_cfg_resolved = dict(stage_cfg)
         epochs_key, default_ckpt, default_log = defaults[stage]
-        epochs = int(stage_cfg.get("epochs", train_cfg.get(epochs_key, 20 if stage != "stage3" else 30)))
+        epochs = int(stage_cfg_resolved.get("epochs", train_cfg.get(epochs_key, default_epochs)))
         checkpoint_path = _resolve_child_path(
             checkpoint_root,
-            stage_cfg.get("checkpoint_path", stage_cfg.get("checkpoint_name")),
+            stage_cfg_resolved.get("checkpoint_path", stage_cfg_resolved.get("checkpoint_name")),
             default_ckpt,
         )
         log_path = _resolve_child_path(
             run_dir,
-            stage_cfg.get("log_csv_path", stage_cfg.get("log_csv")),
+            stage_cfg_resolved.get("log_csv_path", stage_cfg_resolved.get("log_csv")),
             default_log,
         )
-        stage_items.append((stage, epochs, checkpoint_path, log_path, stage_cfg))
+        stage_items.append((stage, epochs, checkpoint_path, log_path, stage_cfg_resolved))
+
+    for stage in ("stage1", "stage2"):
+        stage_cfg = _as_mapping(stages_cfg.get(stage, {}), name=f"stages.{stage}")
+        add_stage(stage, stage_cfg, default_epochs=20)
+
+    stage3_cfg = _as_mapping(stages_cfg.get("stage3", {}), name="stages.stage3")
+    if bool(stage3_cfg.get("two_step_enabled", False)):
+        stage3_common_cfg = dict(stage3_cfg)
+        for key in ("step_a", "step_b", "checkpoint_path", "checkpoint_name", "log_csv_path", "log_csv"):
+            stage3_common_cfg.pop(key, None)
+
+        step_a_cfg = {
+            **stage3_common_cfg,
+            **_as_mapping(stage3_cfg.get("step_a", {}), name="stages.stage3.step_a"),
+        }
+        step_a_cfg.setdefault("concept_guard_enabled", False)
+        step_a_cfg.setdefault("joint_loss", {"lambda_c": 0.0, "lambda_y": 1.0})
+        add_stage("stage3a", step_a_cfg, default_epochs=40)
+
+        step_b_cfg = {
+            **stage3_common_cfg,
+            **_as_mapping(stage3_cfg.get("step_b", {}), name="stages.stage3.step_b"),
+        }
+        step_b_cfg.setdefault("concept_guard_enabled", True)
+        add_stage("stage3b", step_b_cfg, default_epochs=40)
+    else:
+        add_stage("stage3", stage3_cfg, default_epochs=30)
 
     return stage_items
 
@@ -1544,6 +1617,9 @@ def _train_stage_loop(
     concept_noise_std_vector: Optional[torch.Tensor],
     concept_noise_summary: Optional[Mapping[str, object]],
     stage_monitor_metric: Optional[str],
+    stage3_concept_guard_enabled: bool = False,
+    stage3_reference_concept_loss: Optional[float] = None,
+    stage3_concept_loss_max_delta: float = 0.0,
 ) -> Tuple[int, float, List[Dict[str, object]]]:
     best_epoch = -1
     best_score = -float("inf")
@@ -1599,7 +1675,10 @@ def _train_stage_loop(
                 monitor_metric_name = "val_label_loss"
                 monitor_metric_raw = val_label_loss
                 selection_score = -monitor_metric_raw
-                scheduler_metric = selection_score
+                # Checkpoint selection always maximizes selection_score, but the
+                # Stage2 ReduceLROnPlateau scheduler is configured with mode=min
+                # and must therefore see the raw validation loss.
+                scheduler_metric = monitor_metric_raw
                 monitor_tie_break_name = "val_auc"
                 monitor_tie_break_raw = val_auc
                 tie_break_score = val_auc if np.isfinite(val_auc) else -float("inf")
@@ -1655,7 +1734,20 @@ def _train_stage_loop(
                 selection_score = monitor_metric_raw
                 scheduler_metric = monitor_metric_raw
 
-        improved = (selection_score - best_score) > float(early_stop_min_delta)
+        raw_improved = (selection_score - best_score) > float(early_stop_min_delta)
+        concept_guard_threshold = None
+        concept_guard_passed = True
+        if (
+            _is_stage3_variant(stage)
+            and stage3_concept_guard_enabled
+            and stage3_reference_concept_loss is not None
+            and np.isfinite(float(stage3_reference_concept_loss))
+        ):
+            concept_guard_threshold = float(stage3_reference_concept_loss) + float(stage3_concept_loss_max_delta)
+            val_concept_loss = float(val_stats["concept_loss"])
+            concept_guard_passed = bool(val_concept_loss <= concept_guard_threshold)
+
+        improved = raw_improved and concept_guard_passed
         if (
             not improved
             and stage == "stage2"
@@ -1696,12 +1788,23 @@ def _train_stage_loop(
             "selection_score": selection_score,
             "scheduler_metric": scheduler_metric,
             "is_best": int(improved),
+            "raw_improved": int(raw_improved),
             "best_score_so_far": best_score,
             "effective_pos_weight": effective_pos_weight_value,
             "train_sampler_type": sampling_summary["sampler_type"],
             "train_pos_sampling_ratio": sampling_summary["pos_ratio"],
             "train_neg_sampling_ratio": sampling_summary["neg_ratio"],
         }
+        if _is_stage3_variant(stage):
+            row["concept_guard_enabled"] = int(stage3_concept_guard_enabled)
+            row["concept_guard_reference_loss"] = (
+                float(stage3_reference_concept_loss)
+                if stage3_reference_concept_loss is not None
+                else None
+            )
+            row["concept_guard_max_delta"] = float(stage3_concept_loss_max_delta)
+            row["concept_guard_threshold"] = concept_guard_threshold
+            row["concept_guard_passed"] = int(concept_guard_passed)
         if stage == "stage2":
             row["monitor_tie_break_name"] = monitor_tie_break_name
             row["monitor_tie_break_raw"] = monitor_tie_break_raw
@@ -1719,10 +1822,19 @@ def _train_stage_loop(
         tie_break_text = ""
         if stage == "stage2" and monitor_tie_break_name is not None and monitor_tie_break_raw is not None:
             tie_break_text = f" tie={monitor_tie_break_name} raw={monitor_tie_break_raw:.6f}"
+        guard_text = ""
+        if _is_stage3_variant(stage) and stage3_concept_guard_enabled:
+            threshold_text = (
+                f"{concept_guard_threshold:.6f}"
+                if concept_guard_threshold is not None
+                else "disabled"
+            )
+            guard_text = f" concept_guard={concept_guard_passed} threshold={threshold_text} "
         print(
             f"[{stage}] epoch={epoch:03d} metric={monitor_metric_name} raw={monitor_metric_raw:.6f} "
             f"select={selection_score:.6f} best={best_score:.6f} improved={improved} "
             f"{tie_break_text}"
+            f"{guard_text}"
             f"sampler={sampling_summary['sampler_type']} "
             f"pos_ratio={sampling_summary['pos_ratio']:.3f} "
             f"neg_ratio={sampling_summary['neg_ratio']:.3f} "
@@ -1743,6 +1855,12 @@ def _train_stage_loop(
             break
 
     if best_epoch < 0:
+        if _is_stage3_variant(stage) and stage3_concept_guard_enabled:
+            raise RuntimeError(
+                f"{stage} finished without a checkpoint that satisfied the concept guard. "
+                f"Relax stages.stage3.concept_guard_max_delta, disable concept_guard_enabled, "
+                f"or inspect {log_csv_path.name} for val_concept_loss drift."
+            )
         raise RuntimeError(f"{stage} finished without best checkpoint.")
 
     # 导出阶段日志
@@ -1895,12 +2013,16 @@ def main() -> None:
             )
             _apply_encoder_freeze(model, stage_freeze_layer_names, stage="stage1")
 
-        # Stage3：同样支持冻结 encoder 浅层，防止联合微调时特征提取层大幅偏移
-        if stage == "stage3":
+        if stage == "stage3a":
+            print("[stage3a] trainable policy: label_head only (encoder and concept_head frozen)")
+
+        # Stage3B/旧版 Stage3：支持冻结 encoder 浅层，防止联合微调时特征提取层大幅偏移。
+        # Stage3A 由 set_train_stage 固定为 label_head-only，不再做 encoder 层级解冻。
+        if stage in {"stage3", "stage3b"}:
             stage_freeze_layer_names = _parse_freeze_encoder_layers(
                 stage_cfg.get("freeze_encoder_layers", None)
             )
-            _apply_encoder_freeze(model, stage_freeze_layer_names, stage="stage3")
+            _apply_encoder_freeze(model, stage_freeze_layer_names, stage=stage)
 
         stage2_patient_level = bool(stage_cfg.get("patient_level", False))
         stage2_concept_noise_mode = _normalize_key(stage_cfg.get("concept_noise_mode", "gaussian"))
@@ -1920,10 +2042,45 @@ def main() -> None:
             raise ValueError(f"stages.{stage}.concept_noise_std must be >= 0, got {stage2_concept_noise_std}")
         stage_monitor_metric = _resolve_stage_monitor_metric(stage_cfg, stage)
         stage_label_loss_cfg = _resolve_stage_label_loss_config(label_loss_cfg, stage_cfg, stage)
+        stage_joint_loss_cfg = _resolve_stage_joint_loss_config(joint_loss_cfg, stage_cfg, stage)
+        stage_lambda_c = float(stage_joint_loss_cfg.get("lambda_c", lambda_c))
+        stage_lambda_y = float(stage_joint_loss_cfg.get("lambda_y", lambda_y))
+        stage3_concept_guard_enabled = False
+        stage3_reference_concept_loss: Optional[float] = None
+        stage3_concept_loss_max_delta = 0.0
+        if _is_stage3_variant(stage):
+            stage3_concept_guard_enabled = bool(stage_cfg.get("concept_guard_enabled", True))
+            stage3_concept_loss_max_delta = float(stage_cfg.get("concept_guard_max_delta", 0.10))
+            if stage3_concept_loss_max_delta < 0.0:
+                raise ValueError(
+                    "stages.stage3.concept_guard_max_delta must be >= 0, "
+                    f"got {stage3_concept_loss_max_delta}."
+                )
+            explicit_reference_loss = stage_cfg.get("concept_guard_reference_loss", None)
+            if explicit_reference_loss is not None:
+                stage3_reference_concept_loss = float(explicit_reference_loss)
+            elif "stage1" in stage_summary:
+                # Stage1 selection score is -val_concept_loss.
+                stage3_reference_concept_loss = -float(stage_summary["stage1"]["best_score"])
+
+            if stage3_concept_guard_enabled and stage3_reference_concept_loss is None:
+                print(
+                    f"[{stage}] concept guard requested but no Stage1 reference loss is available; "
+                    "disabling concept guard."
+                )
+                stage3_concept_guard_enabled = False
+            elif stage3_concept_guard_enabled:
+                print(
+                    f"[{stage}] concept guard: require val_concept_loss <= "
+                    f"{stage3_reference_concept_loss + stage3_concept_loss_max_delta:.6f} "
+                    f"(reference={stage3_reference_concept_loss:.6f}, "
+                    f"delta={stage3_concept_loss_max_delta:.6f})"
+                )
+
         stage_effective_loss_cfg = {
             "concept": dict(concept_loss_cfg),
             "label": dict(stage_label_loss_cfg),
-            "joint": dict(joint_loss_cfg),
+            "joint": dict(stage_joint_loss_cfg),
         }
         stage_effective_pos_weight = _compute_pos_weight_from_train_patients(
             datasets["train"],
@@ -2023,8 +2180,10 @@ def main() -> None:
             scheduler_step_mode=scheduler_step_mode,
             device=device,
             epochs=epochs,
-            early_stop_patience=int(train_cfg.get("early_stop_patience", 10)),
-            early_stop_min_delta=float(train_cfg.get("early_stop_min_delta", 0.0)),
+            early_stop_patience=int(stage_cfg.get("early_stop_patience", train_cfg.get("early_stop_patience", 10))),
+            early_stop_min_delta=float(
+                stage_cfg.get("early_stop_min_delta", train_cfg.get("early_stop_min_delta", 0.0))
+            ),
             checkpoint_path=ckpt_path,
             log_csv_path=log_path,
             run_id=run_id,
@@ -2046,13 +2205,16 @@ def main() -> None:
             label_loss_config=stage_label_loss_cfg,
             topk_pool=topk_pool,
             threshold=threshold,
-            lambda_c=lambda_c,
-            lambda_y=lambda_y,
+            lambda_c=stage_lambda_c,
+            lambda_y=stage_lambda_y,
             pos_weight=stage_effective_pos_weight,
             concept_noise_std=stage2_concept_noise_std,
             concept_noise_std_vector=stage_concept_noise_std_vector,
             concept_noise_summary=stage_concept_noise_summary,
             stage_monitor_metric=stage_monitor_metric,
+            stage3_concept_guard_enabled=stage3_concept_guard_enabled,
+            stage3_reference_concept_loss=stage3_reference_concept_loss,
+            stage3_concept_loss_max_delta=stage3_concept_loss_max_delta,
         )
 
         # 下一阶段从当前阶段最佳权重继续
@@ -2073,11 +2235,26 @@ def main() -> None:
             "stage2_concept_noise_std": stage2_concept_noise_std if stage == "stage2" else 0.0,
             "stage2_concept_noise_summary": stage_concept_noise_summary if stage == "stage2" else None,
             "stage_monitor_metric": stage_monitor_metric,
+            "trainable_policy": (
+                "label_head_only"
+                if stage in {"stage2", "stage3a"}
+                else "joint_finetune"
+                if _is_stage3_variant(stage)
+                else "concept_finetune"
+            ),
+            "stage3_concept_guard_enabled": stage3_concept_guard_enabled if _is_stage3_variant(stage) else False,
+            "stage3_concept_guard_reference_loss": stage3_reference_concept_loss if _is_stage3_variant(stage) else None,
+            "stage3_concept_guard_max_delta": stage3_concept_loss_max_delta if _is_stage3_variant(stage) else 0.0,
             "effective_pos_weight": float(stage_effective_pos_weight.item()) if stage_effective_pos_weight is not None else None,
             "label_loss_config": dict(stage_label_loss_cfg),
+            "joint_loss_config": dict(stage_joint_loss_cfg),
             "frozen_encoder_layers": stage_freeze_layer_names,
         }
         stage_checkpoint_paths[stage] = ckpt_path
+        if stage == "stage3b":
+            stage_loss_summary["stage3"] = stage_effective_loss_cfg
+            stage_summary["stage3"] = dict(stage_summary[stage])
+            stage_checkpoint_paths["stage3"] = ckpt_path
 
     stage3_ckpt = stage_checkpoint_paths.get("stage3", checkpoint_root / "stage3_best.pt")
     _load_checkpoint_model_only(model, stage3_ckpt, device=device)

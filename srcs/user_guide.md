@@ -15,11 +15,12 @@
 6. [monai_augmentation.py - 数据增强](#monai_augmentationpy---数据增强)
 7. [baseline_ResNet18.py - 基线训练](#baseline_resnet18py---基线训练)
 8. [baseline_RadiomicsLR.py - 传统影像组学基线](#baseline_radiomicslrpy---传统影像组学基线)
-9. [train_habitat_CBM.py - Habitat-CBM 训练解耦工具](#train_habitat_cbmpy---habitat-cbm-训练解耦工具)
+9. [train_habitat_CBM.py - Habitat-CBM 三阶段训练脚本](#train_habitat_cbmpy---habitat-cbm-三阶段训练脚本)
 10. [eval_habitat_CBM.py - Habitat-CBM 推理与验证解耦工具](#eval_habitat_cbmpy---habitat-cbm-推理与验证解耦工具)
-11. [典型工作流程](#典型工作流程)
-12. [数据流说明](#数据流说明)
-13. [常见问题排查](#常见问题排查)
+11. [intervene_habitat_cbm.py - 患者级概念干预工具](#intervene_habitat_cbmpy---患者级概念干预工具)
+12. [典型工作流程](#典型工作流程)
+13. [数据流说明](#数据流说明)
+14. [常见问题排查](#常见问题排查)
 
 ---
 
@@ -81,11 +82,21 @@ python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
     --n-jobs 20 \
     --cv-folds 5
 
-# 6.（可选）Habitat-CBM 训练逻辑自检
-python habitat_CBM/repo/srcs/train_habitat_CBM.py --stage stage3
+# 6.（可选）Habitat-CBM 三阶段训练（训练结束会自动评估）
+python habitat_CBM/repo/srcs/train_habitat_CBM.py \
+    --config habitat_CBM/repo/srcs/args_train_habitat_CBM.json \
+    --run-id run01 \
+    --device cuda:0
 
-# 7.（可选）Habitat-CBM 推理/干预逻辑自检
-python habitat_CBM/repo/srcs/eval_habitat_CBM.py --k 2
+# 7.（可选）Habitat-CBM 患者级概念干预
+python habitat_CBM/repo/srcs/intervene_habitat_cbm.py \
+    --checkpoint habitat_CBM/runs/03_habitat_cbm/run01/checkpoints/stage3_best.pt \
+    --patient-predictions-csv habitat_CBM/results/03_habitat_cbm/run01/patient_predictions_habitat_cbm_run01.csv \
+    --patient-concepts-csv habitat_CBM/results/03_habitat_cbm/run01/patient_concepts_habitat_cbm_run01.csv \
+    --concept-scaler-json habitat_CBM/results/03_habitat_cbm/concept_scaler_stats.json \
+    --output-dir habitat_CBM/results/05_intervention/run01 \
+    --split test \
+    --budgets 1,2,4,all
 ```
 
 ---
@@ -100,8 +111,9 @@ python habitat_CBM/repo/srcs/eval_habitat_CBM.py --k 2
 | `monai_augmentation.py` | 数据增强 | 提供训练时的数据增强变换 | Dataset samples | Augmented samples |
 | `baseline_ResNet18.py` | 基线训练 | 训练 ResNet-18 进行 IDH 分类 | 划分后的数据 | 模型、预测、指标 |
 | `baseline_RadiomicsLR.py` | 传统影像组学基线 | 提取 PyRadiomics 特征并训练 LASSO Logistic Regression | 划分后的 `conventional/` 数据 | 特征表、模型、预测、指标 |
-| `train_habitat_CBM.py` | Habitat-CBM 训练工具 | 提供 stage 冻结、loss、参数组、step 模板（与模型解耦） | `HabitatCBM` + 张量批次 | 训练期中间结果（loss/tensor） |
-| `eval_habitat_CBM.py` | Habitat-CBM 评估工具 | 提供批量推理、TTI 干预、患者级聚合（与模型解耦） | `HabitatCBM` + 推理批次 | 预测/干预结果与聚合结果 |
+| `train_habitat_CBM.py` | Habitat-CBM 三阶段训练 | JSON 配置驱动训练 Stage1/2/3，并自动导出患者级评估 | split 数据 + concept labels/scaler | stage checkpoints、训练日志、患者级预测/概念表 |
+| `eval_habitat_CBM.py` | Habitat-CBM 评估工具 | 独立重跑推理、患者级聚合、图表导出 | checkpoint + split 数据 + concept scaler | 预测/指标/概念误差/图表 |
+| `intervene_habitat_cbm.py` | 患者级概念干预 | 离线修正预测概念并重新计算 `C->Y` | stage3 checkpoint + 患者级预测/概念 CSV | 干预前后指标、病例级纠正表 |
 
 ---
 
@@ -962,19 +974,38 @@ python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
 
 ---
 
-## train_habitat_CBM.py - Habitat-CBM 训练解耦工具
+## train_habitat_CBM.py - Habitat-CBM 三阶段训练脚本
 
 ### 功能描述
 
-`train_habitat_CBM.py` 不是完整的训练主脚本，而是一个**训练逻辑工具层**。  
-它把以下内容从 `models/habitat_CBM.py` 中解耦出来：
+`train_habitat_CBM.py` 是 Habitat-CBM 的主训练脚本。当前版本使用 `args_train_habitat_CBM.json` 作为主配置，完成 Stage1/Stage2/Stage3 三阶段训练、早停、分阶段 checkpoint 保存，并在训练结束后自动执行患者级评估导出。
+
+它同时保留了一组训练工具函数，把以下逻辑从 `models/habitat_CBM.py` 中解耦出来：
 
 1. 三阶段冻结策略（`stage1/stage2/stage3`）
 2. 参数组构建（`encoder/concept_head/label_head`）
-3. `MSE/BCEWithLogits/Joint` 损失定义
-4. stage 级别最小训练 step 模板
+3. `MSE/MAE/Huber` 概念损失、`BCE/Focal BCE` 标签损失和 joint loss
+4. stage 级别训练/验证循环、早停和日志导出
 
-### 核心接口
+当前默认 Stage2 是患者级纯 oracle 校准：冻结 `encoder` 与 `concept_head`，只用真实标准化概念 `concept_true_std` 训练单层 `label_head`。默认关闭 label head Dropout 与 Stage2 概念噪声，并用 `val_label_loss` 选择 checkpoint；学习率调度器接收原始 `val_label_loss`，与 `ReduceLROnPlateau(mode="min")` 保持一致。只有当纯 oracle `C_true→Y` 链路稳定后，才建议把 `stages.stage2.concept_noise_mode` 改为 `residual` 做鲁棒性扫描。
+
+当前默认 Stage3 是稳妥两步式。`stages.stage3.two_step_enabled=true` 时，训练顺序展开为 Stage1 -> Stage2 -> Stage3A -> Stage3B：Stage3A 冻结 `encoder/concept_head`，只用预测概念 `c_hat` 训练 `label_head`，默认 `lr_label_head=5e-4`，产物为 `stage3a_label_adapt_best.pt`；Stage3B 从 Stage3A 最优权重继续，冻结 `conv1/bn1/layer1/layer2/layer3`，只用极小学习率微调 `layer4/concept_head/label_head`，默认 `lr_encoder=5e-7`、`lr_concept_head=1e-6`、`lr_label_head=3e-6`。Stage3B 启用 concept guard，只有在 `val_auc` 改善且 `val_concept_loss <= Stage1 best val_concept_loss + concept_guard_max_delta` 时才保存最终 `stage3_best.pt`，默认 `concept_guard_max_delta=0.08`。
+
+### 主要命令行参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--config` | `Path` | `args_train_habitat_CBM.json` | JSON 主配置文件 |
+| `--run-id` | `str` | 配置或时间戳 | 当前训练 run 的标识 |
+| `--output-root` | `Path` | 配置值 | 同时覆盖 runs/results 根目录 |
+| `--checkpoint-root` | `Path` | 配置值 | checkpoint 输出目录 |
+| `--device` | `str` | 配置值 | `cpu`、`cuda:0` 等 |
+| `--epochs-stage1` | `int` | 配置值 | 覆盖 Stage1 最大 epoch |
+| `--epochs-stage2` | `int` | 配置值 | 覆盖 Stage2 最大 epoch |
+| `--epochs-stage3` | `int` | 配置值 | 覆盖 Stage3 最大 epoch |
+| `--batch-size` | `int` | 配置值 | 覆盖全局 batch size |
+
+### 核心工具接口
 
 | 函数 | 作用 |
 |------|------|
@@ -987,24 +1018,45 @@ python habitat_CBM/repo/srcs/baseline_RadiomicsLR.py \
 | `stage2_train_step(...)` | Stage2（C->Y）最小 step |
 | `stage3_train_step(...)` | Stage3（X->C->Y）最小 step |
 
-### 最小用法示例
+### 最小训练示例
 
 ```bash
-# 随机张量自检（默认 stage3）
-python habitat_CBM/repo/srcs/train_habitat_CBM.py --stage stage3
+# 使用默认 JSON 配置训练
+python habitat_CBM/repo/srcs/train_habitat_CBM.py \
+  --config habitat_CBM/repo/srcs/args_train_habitat_CBM.json \
+  --run-id run01 \
+  --device cuda:0
 
-# 检查 Stage1 逻辑
-python habitat_CBM/repo/srcs/train_habitat_CBM.py --stage stage1
-
-# 检查 Stage2 逻辑
-python habitat_CBM/repo/srcs/train_habitat_CBM.py --stage stage2
+# 快速调试：减少三阶段 epoch
+python habitat_CBM/repo/srcs/train_habitat_CBM.py \
+  --config habitat_CBM/repo/srcs/args_train_habitat_CBM.json \
+  --run-id debug01 \
+  --device cuda:0 \
+  --epochs-stage1 2 \
+  --epochs-stage2 2 \
+  --epochs-stage3 2
 ```
 
-### 设计建议
+训练完成后重点产物：
 
-1. 把 dataloader、epoch、early-stop、日志导出放在你后续的主训练脚本里。
-2. 主训练脚本内部直接调用该工具文件的函数，保持职责清晰。
-3. 不要把 loss 或 stage 逻辑重新写回 `models/habitat_CBM.py`。
+```text
+runs_root/<run_id>/
+├── checkpoints/stage1_best.pt
+├── checkpoints/stage2_best.pt
+├── checkpoints/stage3a_label_adapt_best.pt
+├── checkpoints/stage3_best.pt
+├── stage1_concept_log.csv
+├── stage2_label_head_log.csv
+├── stage3a_label_adapt_log.csv
+└── stage3_joint_log.csv
+
+results_root/<run_id>/
+├── patient_predictions_habitat_cbm_<run_id>.csv
+├── patient_concepts_habitat_cbm_<run_id>.csv
+├── metrics_habitat_cbm_<run_id>.csv
+├── wrong_cases_habitat_cbm_<run_id>.csv
+└── run_train_summary_habitat_cbm_<run_id>.json
+```
 
 ---
 
@@ -1032,11 +1084,24 @@ python habitat_CBM/repo/srcs/train_habitat_CBM.py --stage stage2
 ### 最小用法示例
 
 ```bash
-# 随机张量自检
-python habitat_CBM/repo/srcs/eval_habitat_CBM.py --k 2
+# 独立重跑 test 集评估
+python habitat_CBM/repo/srcs/eval_habitat_CBM.py \
+  --config habitat_CBM/repo/srcs/args_train_habitat_CBM.json \
+  --checkpoint habitat_CBM/runs/03_habitat_cbm/run01/checkpoints/stage3_best.pt \
+  --run-id run01_eval \
+  --output-dir habitat_CBM/results/03_habitat_cbm/run01_eval \
+  --device cuda:0 \
+  --splits test
 
-# 预算为全部概念（当前默认 n_concepts=5）
-python habitat_CBM/repo/srcs/eval_habitat_CBM.py --k 5
+# 同时评估 train/val/test，并使用固定阈值
+python habitat_CBM/repo/srcs/eval_habitat_CBM.py \
+  --config habitat_CBM/repo/srcs/args_train_habitat_CBM.json \
+  --checkpoint habitat_CBM/runs/03_habitat_cbm/run01/checkpoints/stage3_best.pt \
+  --run-id run01_eval_all \
+  --output-dir habitat_CBM/results/03_habitat_cbm/run01_eval_all \
+  --device cuda:0 \
+  --threshold 0.5 \
+  --splits train,val,test
 ```
 
 ### 干预策略说明
@@ -1044,6 +1109,240 @@ python habitat_CBM/repo/srcs/eval_habitat_CBM.py --k 5
 1. 当 `order=None` 时，默认按 `|c_pred - c_true_std|` 从大到小选概念。
 2. `k` 为干预预算，`k > n_concepts` 会自动截断为 `n_concepts`。
 3. `order` 若手动提供，必须是概念索引的合法排列。
+
+---
+
+## intervene_habitat_cbm.py - 患者级概念干预工具
+
+### 功能描述
+
+`intervene_habitat_cbm.py` 用于运行 Habitat-CBM 的患者级 TTI（test-time intervention）分析。
+
+它模拟一个离线的“概念纠错”过程：
+
+1. 读取训练后导出的患者级 IDH 预测结果；
+2. 读取同一批患者的预测概念值和真实概念值；
+3. 对每个患者，按标准化概念误差 `|c_pred_std - c_true_std|` 从大到小排序；
+4. 在给定干预预算 `k` 下，把误差最大的前 `k` 个预测概念替换为真实概念；
+5. 不再重跑图像编码器，只调用训练好的 `C->Y` 标签头重新计算 IDH 概率；
+6. 对比干预前后 AUC、Accuracy、F1，以及误判病例纠正率。
+
+这个脚本不是在线推理脚本，而是一个 post-hoc 患者级分析工具。它回答的问题是：如果测试时有专家能纠正模型最不准的概念，最终 IDH 预测是否会改善。
+
+### 运行前置条件
+
+必须先完成 `train_habitat_CBM.py` 的三阶段训练。训练结束后默认会自动导出以下文件：
+
+```text
+habitat_CBM/runs/03_habitat_cbm/<run_id>/checkpoints/
+└── stage3_best.pt
+
+habitat_CBM/results/03_habitat_cbm/<run_id>/
+├── patient_predictions_habitat_cbm_<run_id>.csv
+├── patient_concepts_habitat_cbm_<run_id>.csv
+└── run_train_summary_habitat_cbm_<run_id>.json
+
+habitat_CBM/results/03_habitat_cbm/
+└── concept_scaler_stats.json
+```
+
+四个输入的作用如下：
+
+| 输入 | 作用 |
+|------|------|
+| `stage3_best.pt` | 加载训练好的 `HabitatCBM`，主要使用其中的 `label_head` 执行 `C->Y` |
+| `patient_predictions_*.csv` | 提供患者级 `prob_idh_mut`、`y_true`、split、run_id 等信息 |
+| `patient_concepts_*.csv` | 提供患者级 `c*_pred_std`、`c*_true_std`、`c*_abs_error_std` |
+| `concept_scaler_stats.json` | 校验概念维度；当 concept CSV 只有 raw 值时，用于 raw/std 转换 |
+
+### 命令行参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--checkpoint` | `Path` | **必填** | Stage3 最优 checkpoint，通常是 `stage3_best.pt` |
+| `--patient-predictions-csv` | `Path` | **必填** | `eval_habitat_CBM.py` 或训练结束自动评估导出的患者级预测表 |
+| `--patient-concepts-csv` | `Path` | **必填** | 同一次评估导出的患者级概念表 |
+| `--concept-scaler-json` | `Path` | **必填** | 训练时使用的概念标准化统计文件 |
+| `--output-dir` | `Path` | **必填** | 干预结果输出目录 |
+| `--split` | `str` | `test` | 运行哪个 split：`train`、`val`、`test`、`all` |
+| `--budgets` | `str` | `1,2,4,all` | 干预预算，逗号分隔；数字表示替换前 k 个概念，`all` 表示替换全部概念 |
+| `--threshold` | `float` | `0.5` | 将概率转成 0/1 标签的阈值；建议与正式评估阈值一致 |
+| `--low-confidence-margin` | `float` | `0.1` | 候选病例筛选边界：`abs(prob_before - threshold) < margin` 视为低置信度 |
+| `--device` | `str` | `cpu` | 运行设备，如 `cpu`、`cuda:0` |
+| `--in-channels` | `int` | `35` | checkpoint 缺少 `model_config` 时的 fallback 输入通道数 |
+| `--n-concepts` | `int` | `8` | checkpoint 缺少 `model_config` 时的 fallback 概念数 |
+
+`--in-channels` 和 `--n-concepts` 通常不用手动改。当前 `train_habitat_CBM.py` 保存的 checkpoint 已包含 `model_config`，脚本会优先使用 checkpoint 内的真实配置。
+
+### 最常用运行方式
+
+建议先设置 `RUN_ID`，再从训练 summary 中读取正式评估使用的阈值。训练脚本最终评估会用 val 集 Youden Index 选取阈值，并写入 `run_train_summary_*.json` 的 `threshold.eval_threshold_used`。
+
+```bash
+RUN_ID=run01
+
+THRESHOLD=$(RUN_ID="${RUN_ID}" python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+run_id = os.environ["RUN_ID"]
+summary_path = Path(f"habitat_CBM/results/03_habitat_cbm/{run_id}/run_train_summary_habitat_cbm_{run_id}.json")
+payload = json.loads(summary_path.read_text(encoding="utf-8"))
+print(payload["threshold"]["eval_threshold_used"])
+PY
+)
+
+python habitat_CBM/repo/srcs/intervene_habitat_cbm.py \
+  --checkpoint habitat_CBM/runs/03_habitat_cbm/${RUN_ID}/checkpoints/stage3_best.pt \
+  --patient-predictions-csv habitat_CBM/results/03_habitat_cbm/${RUN_ID}/patient_predictions_habitat_cbm_${RUN_ID}.csv \
+  --patient-concepts-csv habitat_CBM/results/03_habitat_cbm/${RUN_ID}/patient_concepts_habitat_cbm_${RUN_ID}.csv \
+  --concept-scaler-json habitat_CBM/results/03_habitat_cbm/concept_scaler_stats.json \
+  --output-dir habitat_CBM/results/05_intervention/${RUN_ID} \
+  --split test \
+  --budgets 1,2,4,all \
+  --threshold "${THRESHOLD}" \
+  --low-confidence-margin 0.1 \
+  --device cuda:0
+```
+
+如果不想读取动态阈值，也可以直接使用固定阈值：
+
+```bash
+python habitat_CBM/repo/srcs/intervene_habitat_cbm.py \
+  --checkpoint habitat_CBM/runs/03_habitat_cbm/run01/checkpoints/stage3_best.pt \
+  --patient-predictions-csv habitat_CBM/results/03_habitat_cbm/run01/patient_predictions_habitat_cbm_run01.csv \
+  --patient-concepts-csv habitat_CBM/results/03_habitat_cbm/run01/patient_concepts_habitat_cbm_run01.csv \
+  --concept-scaler-json habitat_CBM/results/03_habitat_cbm/concept_scaler_stats.json \
+  --output-dir habitat_CBM/results/05_intervention/run01_thr050 \
+  --split test \
+  --budgets 1,2,4,all \
+  --threshold 0.5
+```
+
+### 其他常用场景
+
+```bash
+# 1. 对 val 集做干预，用于方法调试
+python habitat_CBM/repo/srcs/intervene_habitat_cbm.py \
+  --checkpoint habitat_CBM/runs/03_habitat_cbm/run01/checkpoints/stage3_best.pt \
+  --patient-predictions-csv habitat_CBM/results/03_habitat_cbm/run01/patient_predictions_habitat_cbm_run01.csv \
+  --patient-concepts-csv habitat_CBM/results/03_habitat_cbm/run01/patient_concepts_habitat_cbm_run01.csv \
+  --concept-scaler-json habitat_CBM/results/03_habitat_cbm/concept_scaler_stats.json \
+  --output-dir habitat_CBM/results/05_intervention/run01_val \
+  --split val \
+  --budgets 1,2,4,all
+
+# 2. 更细粒度的 budget 曲线
+python habitat_CBM/repo/srcs/intervene_habitat_cbm.py \
+  --checkpoint habitat_CBM/runs/03_habitat_cbm/run01/checkpoints/stage3_best.pt \
+  --patient-predictions-csv habitat_CBM/results/03_habitat_cbm/run01/patient_predictions_habitat_cbm_run01.csv \
+  --patient-concepts-csv habitat_CBM/results/03_habitat_cbm/run01/patient_concepts_habitat_cbm_run01.csv \
+  --concept-scaler-json habitat_CBM/results/03_habitat_cbm/concept_scaler_stats.json \
+  --output-dir habitat_CBM/results/05_intervention/run01_budget_curve \
+  --split test \
+  --budgets 1,2,3,4,5,6,7,8,all
+
+# 3. CPU 环境运行
+python habitat_CBM/repo/srcs/intervene_habitat_cbm.py \
+  --checkpoint habitat_CBM/runs/03_habitat_cbm/run01/checkpoints/stage3_best.pt \
+  --patient-predictions-csv habitat_CBM/results/03_habitat_cbm/run01/patient_predictions_habitat_cbm_run01.csv \
+  --patient-concepts-csv habitat_CBM/results/03_habitat_cbm/run01/patient_concepts_habitat_cbm_run01.csv \
+  --concept-scaler-json habitat_CBM/results/03_habitat_cbm/concept_scaler_stats.json \
+  --output-dir habitat_CBM/results/05_intervention/run01_cpu \
+  --split test \
+  --device cpu
+```
+
+### 输出文件说明
+
+运行完成后，`--output-dir` 下会生成：
+
+```text
+output_dir/
+├── intervention_case_list.csv
+├── intervention_per_case.csv
+├── intervention_metrics_by_budget.csv
+├── intervention_correction_summary.csv
+└── intervention_summary.csv
+```
+
+各文件含义如下：
+
+| 文件 | 粒度 | 内容 |
+|------|------|------|
+| `intervention_case_list.csv` | 患者 | 候选病例列表；候选 = 干预前误判或低置信度 |
+| `intervention_per_case.csv` | 患者 x budget | 每个患者在每个 budget 下替换了哪些概念、干预前后概率/标签、是否纠正 |
+| `intervention_metrics_by_budget.csv` | budget | 按 `all` 和 `candidate` 两种口径统计 AUC、Accuracy、F1 的干预前后变化 |
+| `intervention_correction_summary.csv` | budget | 在候选误判病例中，有多少被干预纠正，以及纠正率 |
+| `intervention_summary.csv` | run | 本次干预运行的 split、budget、阈值、输入文件路径等元信息 |
+
+重点看两个文件：
+
+1. `intervention_metrics_by_budget.csv`
+   - `scope=all`：所有患者口径，适合汇报整体 TTI 性能提升；
+   - `scope=candidate`：误判或低置信度病例口径，适合分析需要人工复核的病例；
+   - `delta_auc/delta_acc/delta_f1` 大于 0 说明干预后对应指标提升。
+2. `intervention_correction_summary.csv`
+   - `correction_rate` 表示干预前误判病例中被纠正的比例；
+   - 随 `budget_k` 增加，若纠正率明显上升，说明最终预测确实受概念瓶颈控制。
+
+### 干预逻辑细节
+
+对每个患者，脚本执行：
+
+```python
+order = argsort(abs(c_pred_std - c_true_std), descending=True)
+replace_idx = order[:k]
+c_after = c_pred_std.copy()
+c_after[replace_idx] = c_true_std[replace_idx]
+y_prob_after = sigmoid(model.forward_c_to_y(c_after))
+```
+
+因此当前实现是“误差优先”的 oracle TTI：
+
+- 使用真实概念值来判断哪些概念预测误差最大；
+- 替换的是标准化概念 `*_std`，和训练时 `label_head` 输入保持一致；
+- 不重新计算图像特征，也不重新运行 `X->C`；
+- 当前不支持 random order 或固定全局 order；如果需要复现 OAI 风格曲线，需要另外扩展排序策略。
+
+### 结果解读建议
+
+1. 如果 `all` 口径随 `budget_k` 增大持续提升，说明概念瓶颈对最终 IDH 分类有实际控制作用。
+2. 如果 `candidate` 口径提升明显，但 `all` 口径提升不大，说明干预主要帮助边界样本或误判样本。
+3. 如果概念误差被修正后指标仍无提升，可能说明：
+   - `C->Y` 标签头没有充分利用这些概念；
+   - 被修正的概念不是当前患者 IDH 判别的关键概念；
+   - 概念本身与 IDH 标签的可解释关系较弱；
+   - 使用的 `--threshold` 与正式评估阈值不一致，导致标签变化口径不一致。
+4. 论文中建议把该实验称为 `patient-level oracle concept correction` 或 `error-prioritized TTI`，避免表述成真实部署时自动知道哪个概念错误。
+
+### 常见错误
+
+**Q: Missing concept rows for patients**
+```
+说明 patient_predictions CSV 和 patient_concepts CSV 不是同一次评估导出的，
+或者 --split 选择后两个文件中的患者集合不一致。
+```
+
+**Q: Concept table must include either std columns or raw columns**
+```
+检查 patient_concepts CSV 是否包含 c0_true_std/c0_pred_std 等字段。
+正常情况下 train_habitat_CBM.py 自动评估导出的 patient_concepts 文件已经包含这些列。
+```
+
+**Q: checkpoint 加载 shape mismatch**
+```
+通常是 checkpoint 与 patient_concepts 的概念数不一致。
+确认 --checkpoint、--patient-concepts-csv、--concept-scaler-json 来自同一次训练配置。
+```
+
+**Q: 干预前 pred_before 和评估阶段 pred_label 不一致**
+```
+intervene_habitat_cbm.py 会用 --threshold 重新从 prob_idh_mut 计算 pred_before。
+如果训练后正式评估使用的是 Youden 阈值，请把 run_train_summary_*.json 中的
+threshold.eval_threshold_used 传给 --threshold。
+```
 
 ---
 
@@ -1378,6 +1677,7 @@ PyRadiomics 和 sklearn 的 L1 LogisticRegressionCV 都主要走 CPU
 |------|------|------|
 | 1.0 | 2024 | 初始版本，支持 ResNet-18 基线训练 |
 | 1.1 | 2026-04-14 | 新增 `baseline_RadiomicsLR.py`，支持传统影像组学 + LASSO LR 基线 |
+| 1.2 | 2026-04-21 | 新增 `intervene_habitat_cbm.py` 患者级概念干预详细说明，并更新 Habitat-CBM 训练/评估命令 |
 
 ---
 

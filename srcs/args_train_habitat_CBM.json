@@ -61,8 +61,8 @@
     "label_hidden_dim": 32,
     "_comment_concept_dropout_p": "concept_head 中 Dropout 的概率。当前 5 概念可靠子集降低了回归难度，因此用 0.4 减弱正则，提升概念层泛化。",
     "concept_dropout_p": 0.4,
-    "_comment_label_dropout_p": "label_head 中 Dropout 的概率。单层线性头容量更小，5 概念输入下进一步减轻正则，避免过度丢失概念信号。",
-    "label_dropout_p": 0.1,
+    "_comment_label_dropout_p": "label_head 中 Dropout 的概率。Stage2 只用少量患者级概念训练单层线性头，默认关闭 Dropout，避免 oracle C->Y 校准阶段随机丢失概念信号。",
+    "label_dropout_p": 0.0,
     "_comment_pretrained": "是否使用 ResNet18 预训练权重初始化 encoder。具体行为取决于 models/resnet_18.py 的实现。",
     "pretrained": true
   },
@@ -78,7 +78,7 @@
     "num_workers": 4,
     "_comment_early_stop_patience": "早停耐心值。连续多少个 epoch 没有超过 early_stop_min_delta 的改进后停止当前 stage；小于等于 0 表示不早停。",
     "early_stop_patience": 100,
-    "_comment_early_stop_min_delta": "判断指标改进所需的最小提升。Stage1 监控 -val_concept_loss，Stage2/3 优先监控 val_auc。",
+    "_comment_early_stop_min_delta": "判断指标改进所需的最小提升。Stage1 监控 -val_concept_loss，Stage2 默认监控 -val_label_loss，Stage3 默认监控 val_auc。",
     "early_stop_min_delta": 0.002,
     "_comment_patient_balanced_sampling": "是否对 train split 启用患者均衡 + 类别均衡 block 采样。开启后每个患者在一个 epoch 内的期望权重更接近。",
     "patient_balanced_sampling": true,
@@ -160,20 +160,20 @@
       "batch_size": 8,
       "_comment_monitor_metric": "Stage2 最优 checkpoint 的监控指标。推荐 label_loss：它与 BCE 训练目标一致，并且在小验证集上比 AUC 更连续、更稳定。可选：label_loss、auc。",
       "monitor_metric": "label_loss",
-      "_comment_concept_noise_mode": "Stage2 训练期概念噪声模式。residual 表示用 Stage1 在训练集上的患者级概念残差估计逐概念噪声尺度；gaussian 表示旧版统一高斯噪声；none/off/disabled 表示不加噪声。验证期不注入噪声。",
-      "concept_noise_mode": "residual",
-      "_comment_concept_noise_std": "Stage2 概念噪声的平均强度。单层 label_head 对输入扰动更敏感，因此相较旧双层头适度减小噪声，保留 bridge train-test gap 的同时降低欠拟合风险。",
-      "concept_noise_std": 0.08,
-      "_comment_concept_noise_min_std": "residual 模式下逐概念噪声标准差的下限，防止某些概念残差过小导致完全不加噪声。",
-      "concept_noise_min_std": 0.02,
+      "_comment_concept_noise_mode": "Stage2 训练期概念噪声模式。默认 none 表示先做纯 oracle C_true->Y 校准，用于确认概念子集本身是否有标签判别力；当 oracle 链路稳定后，可改为 residual 以桥接 Stage1 预测概念的残差分布。",
+      "concept_noise_mode": "none",
+      "_comment_concept_noise_std": "Stage2 概念噪声的平均强度。concept_noise_mode=none 时该值不生效；若后续启用 residual，可从 0.03~0.08 小范围扫描。",
+      "concept_noise_std": 0.0,
+      "_comment_concept_noise_min_std": "residual 模式下逐概念噪声标准差的下限，防止某些概念残差过小导致完全不加噪声；concept_noise_mode=none 时不生效。",
+      "concept_noise_min_std": 0.0,
       "_comment_concept_noise_max_std": "residual 模式下逐概念噪声标准差的上限。null 表示不设上限。",
       "concept_noise_max_std": null,
-      "_comment_optimizer": "Stage2 现在只训练一个 Dropout + Linear 线性头。相较旧双层 MLP，可显著提高 label_head 学习率并减轻 weight decay，让患者级逻辑回归头更快收敛到稳定系数。",
+      "_comment_optimizer": "Stage2 只训练一个 Linear 线性头。当前默认作为纯 oracle C_true->Y 校准阶段，使用更高学习率和无 weight decay，让患者级逻辑回归头先收敛到可解释的稳定系数。",
       "optimizer": {
         "name": "adamw",
-        "lr": 0.001,
-        "lr_label_head": 0.001,
-        "weight_decay": 0.001,
+        "lr": 0.003,
+        "lr_label_head": 0.003,
+        "weight_decay": 0.0,
         "betas": [0.9, 0.999],
         "eps": 1e-08,
         "amsgrad": false
@@ -193,44 +193,106 @@
       }
     },
     "stage3": {
-      "_comment": "Stage3: 联合微调 X->C->Y，默认冻结 layer1/layer2/layer3，保留 conv1/bn1 的输入适配能力以及 layer4/concept_head/label_head 的高层微调能力；总 loss = lambda_c * concept_loss + lambda_y * label_loss。",
-      "_comment_epochs": "Stage3 最大训练 epoch 数，可能因早停提前结束。",
-      "epochs": 100,
-      "_comment_checkpoint_name": "Stage3 最优权重文件名，保存到 checkpoint_root 下；训练结束后自动用它做正式评估。",
-      "checkpoint_name": "stage3_best.pt",
-      "_comment_log_csv": "Stage3 训练日志文件名，保存到 runs_root/run_id 下。",
-      "log_csv": "stage3_joint_log.csv",
-      "_comment_batch_size": "Stage3 单独的 DataLoader batch size。未设置时继承 train.batch_size；当前用 32 增加联合微调阶段的每 epoch 更新步数。",
+      "_comment": "Stage3 默认启用稳妥两步式：Stage3A 冻结 encoder/concept_head，只用预测概念 c_hat 适配 label_head；Stage3B 从 Stage3A 最优权重出发，用极小学习率做概念约束 joint fine-tune。",
+      "_comment_two_step_enabled": "true 时训练顺序为 Stage1 -> Stage2 -> Stage3A -> Stage3B。最终正式评估仍使用 Stage3B 输出的 stage3_best.pt。",
+      "two_step_enabled": true,
+      "_comment_epochs": "Stage3 子阶段缺省 epoch fallback；step_a/step_b 内显式 epochs 优先生效。",
+      "epochs": 50,
+      "_comment_batch_size": "Stage3A/Stage3B 默认 DataLoader batch size。未在子阶段覆盖时继承这里。",
       "batch_size": 32,
-      "_comment_freeze_encoder_layers": "Stage3 中需要冻结的 ResNet-18 encoder 层名列表，与 Stage1 语义相同。可用层名：conv1、bn1、layer1、layer2、layer3、layer4。设为 null 或空列表表示不冻结任何层。当前默认冻结 layer1/layer2/layer3，保留 conv1/bn1 的输入适配能力和 layer4 的高层微调能力。",
-      "freeze_encoder_layers": ["layer1", "layer2", "layer3"],
-      "_comment_optimizer": "Stage3 单独优化器覆盖：单层 label_head 需要比 encoder/concept_head 更积极地适配 joint fine-tune，但 encoder 仍保持保守更新，避免概念层被分类目标过快拉偏。",
-      "optimizer": {
-        "name": "adamw",
-        "lr": 0.00001,
-        "lr_encoder": 0.000003,
-        "lr_concept_head": 0.000008,
-        "lr_label_head": 0.00003,
-        "weight_decay": 0.005,
-        "betas": [
-          0.9,
-          0.999
-        ],
-        "eps": 1e-08,
-        "amsgrad": false
-      },
-      "_comment_scheduler": "Stage3 单独调度器覆盖：单层头收敛更快，因此适度缩短 patience，让 joint fine-tune 更早进入小步长区间。",
-      "scheduler": {
-        "enabled": true,
-        "name": "reduce_on_plateau",
-        "mode": "max",
-        "factor": 0.5,
-        "patience": 6,
-        "min_lr": 1e-07
-      },
       "_comment_label_loss": "Stage3 标签损失覆盖。联合微调时已启用患者/类别均衡采样，因此默认关闭 pos_weight，避免双重类别再平衡。",
       "label_loss": {
         "use_pos_weight": false
+      },
+      "_comment_step_a": "Stage3A: predicted-concept label adaptation。冻结 encoder/concept_head，只训练 label_head；目标是桥接 Stage2 的 C_true->Y 与推理时 C_hat->Y 的分布偏移。",
+      "step_a": {
+        "_comment_epochs": "Stage3A 最大训练 epoch 数。label_head-only 风险低但验证集 AUC 高方差，因此给足退火窗口。",
+        "epochs": 100,
+        "_comment_checkpoint_name": "Stage3A 最优权重，仅作为 Stage3B 初始化。",
+        "checkpoint_name": "stage3a_label_adapt_best.pt",
+        "_comment_log_csv": "Stage3A 训练日志。",
+        "log_csv": "stage3a_label_adapt_log.csv",
+        "_comment_joint_loss": "Stage3A 只优化分类 loss；概念 loss 仍记录但不参与反向传播。",
+        "joint_loss": {
+          "lambda_c": 0.0,
+          "lambda_y": 1.0
+        },
+        "_comment_concept_guard_enabled": "Stage3A 冻结概念预测层，因此不需要 concept guard。",
+        "concept_guard_enabled": false,
+        "_comment_optimizer": "Stage3A 只训练单层 label_head。学习率低于 Stage2 oracle，但足够适配 noisy c_hat 分布。",
+        "optimizer": {
+          "name": "adamw",
+          "lr": 0.0005,
+          "lr_label_head": 0.0005,
+          "weight_decay": 0.0001,
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "eps": 1e-08,
+          "amsgrad": false
+        },
+        "_comment_scheduler": "Stage3A 监控 val_auc；若验证 AUC 平台期则逐步降低 label_head 学习率。",
+        "scheduler": {
+          "enabled": true,
+          "name": "reduce_on_plateau",
+          "mode": "max",
+          "factor": 0.5,
+          "patience": 8,
+          "min_lr": 1e-06
+        },
+        "_comment_early_stop_patience": "Stage3A 独立早停，保证至少经历数次 lr 退火机会。",
+        "early_stop_patience": 100,
+        "early_stop_min_delta": 0.001
+      },
+      "_comment_step_b": "Stage3B: guarded joint fine-tune。从 Stage3A 最优权重出发，冻结浅层 encoder，只用极小学习率微调 layer4/concept_head/label_head；checkpoint 必须通过概念 loss guard。",
+      "step_b": {
+        "_comment_epochs": "Stage3B 最大训练 epoch 数。小学习率下需要比旧 Stage3 更长的观察窗口。",
+        "epochs": 100,
+        "_comment_checkpoint_name": "Stage3B 最优权重；训练结束后自动用于正式评估。",
+        "checkpoint_name": "stage3_best.pt",
+        "_comment_log_csv": "Stage3B joint fine-tune 日志。",
+        "log_csv": "stage3_joint_log.csv",
+        "_comment_freeze_encoder_layers": "Stage3B 冻结 conv1/bn1/layer1/layer2/layer3，仅允许 layer4、concept_head 和 label_head 小步更新。",
+        "freeze_encoder_layers": ["conv1", "bn1", "layer1", "layer2", "layer3"],
+        "_comment_joint_loss": "Stage3B 提高概念约束权重，避免分类目标把概念层拉成非语义隐变量。",
+        "joint_loss": {
+          "lambda_c": 0.75,
+          "lambda_y": 1.0
+        },
+        "_comment_concept_guard_enabled": "启用后，Stage3B 只有在 val_auc 改善且 val_concept_loss 不超过参考概念 loss + 容忍量时才保存 best checkpoint。",
+        "concept_guard_enabled": true,
+        "_comment_concept_guard_reference_loss": "null 表示自动使用 Stage1 best 的 val_concept_loss。",
+        "concept_guard_reference_loss": null,
+        "_comment_concept_guard_max_delta": "Stage3B 允许的概念 loss 恶化幅度。0.08 比旧 0.10 更保守。",
+        "concept_guard_max_delta": 0.08,
+        "_comment_optimizer": "Stage3B 极小学习率 joint fine-tune。label_head 已在 Stage3A 适配，因此这里也只允许小步调整。",
+        "optimizer": {
+          "name": "adamw",
+          "lr": 0.000001,
+          "lr_encoder": 0.0000005,
+          "lr_concept_head": 0.000001,
+          "lr_label_head": 0.000003,
+          "weight_decay": 0.005,
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "eps": 1e-08,
+          "amsgrad": false
+        },
+        "_comment_scheduler": "Stage3B 仍监控 val_auc，但 checkpoint 还必须通过 concept guard。",
+        "scheduler": {
+          "enabled": true,
+          "name": "reduce_on_plateau",
+          "mode": "max",
+          "factor": 0.5,
+          "patience": 8,
+          "min_lr": 1e-08
+        },
+        "_comment_early_stop_patience": "Stage3B 独立早停，避免 AUC 短期波动导致过早停止。",
+        "early_stop_patience": 100,
+        "early_stop_min_delta": 0.001
       }
     },
     "_comment_stage_override": "如需单独给某个 stage 设置优化器或调度器，可在 stage1/stage2/stage3 内加入 optimizer 或 scheduler 子对象，它会覆盖全局 optimizer/scheduler 的同名字段。"
