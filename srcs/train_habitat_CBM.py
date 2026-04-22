@@ -1624,6 +1624,8 @@ def _train_stage_loop(
     best_epoch = -1
     best_score = -float("inf")
     best_tie_break_score = -float("inf")
+    # Stage3 tie-break: 同 AUC 时优先保留 val_concept_loss 更低的 checkpoint（越低越好，取负数）
+    best_stage3_tie_break_score = -float("inf")
     no_improve = 0
     history: List[Dict[str, object]] = []
     sampling_summary = _summarize_loader_sampling(train_loader)
@@ -1748,17 +1750,41 @@ def _train_stage_loop(
             concept_guard_passed = bool(val_concept_loss <= concept_guard_threshold)
 
         improved = raw_improved and concept_guard_passed
+
+        # ── 修复2：Stage2 tie-break 收紧为严格相等（selection_score 完全相同）────────
+        # 原实现用 abs(diff) <= min_delta 作为"相等"判断，当 min_delta > 0 时会把略差
+        # 的主指标 epoch 也纳入 tie-break，可能用更差的主指标覆盖更好的 checkpoint。
+        # 修正为浮点严格相等（diff == 0.0），保证 tie-break 只在主指标无差异时触发。
         if (
             not improved
             and stage == "stage2"
             and monitor_tie_break_name is not None
-            and abs(selection_score - best_score) <= float(early_stop_min_delta)
+            and (selection_score - best_score) == 0.0
             and tie_break_score > best_tie_break_score
         ):
             improved = True
+
+        # ── 修复1：Stage3 tie-break —— 同 AUC 时保留 val_concept_loss 更低的 ckpt ──
+        # 小样本场景下 AUC 取值为离散格点（k/n），大量 epoch 会出现完全相同的 AUC。
+        # 此时优先保留 val_concept_loss 更低的 checkpoint，兼顾分类性能与概念质量。
+        # 仅在 concept_guard 通过时才允许 tie-break 覆盖，避免引入劣质概念的 ckpt。
+        if (
+            not improved
+            and _is_stage3_variant(stage)
+            and not np.isnan(float(val_stats.get("auc", float("nan"))))
+            and (selection_score - best_score) == 0.0
+            and concept_guard_passed
+            and "concept_loss" in val_stats
+        ):
+            stage3_tie_score = -float(val_stats["concept_loss"])
+            if stage3_tie_score > best_stage3_tie_break_score:
+                improved = True
+
         if improved:
             best_score = selection_score
             best_tie_break_score = tie_break_score if stage == "stage2" else -float("inf")
+            if _is_stage3_variant(stage) and "concept_loss" in val_stats:
+                best_stage3_tie_break_score = -float(val_stats["concept_loss"])
             best_epoch = epoch
             no_improve = 0
             _save_checkpoint(
@@ -1778,7 +1804,14 @@ def _train_stage_loop(
                 monitor_name=monitor_metric_name,
             )
         else:
-            no_improve += 1
+            # ── 修复3：concept_guard 拦截不累计 patience ────────────────────────────
+            # 原实现：guard 拦截 → improved=False → no_improve+=1，可能提前触发早停。
+            # 修正：guard 拦截（raw_improved=True 但 concept_guard_passed=False）时，
+            # 说明模型分类性能在提升但概念质量暂时超标，属于过渡状态，不应消耗 patience。
+            if raw_improved and not concept_guard_passed:
+                pass  # guard 拦截，不计入 patience，等待 concept_loss 回落
+            else:
+                no_improve += 1
 
         row: Dict[str, object] = {
             "epoch": epoch,
@@ -1822,6 +1855,8 @@ def _train_stage_loop(
         tie_break_text = ""
         if stage == "stage2" and monitor_tie_break_name is not None and monitor_tie_break_raw is not None:
             tie_break_text = f" tie={monitor_tie_break_name} raw={monitor_tie_break_raw:.6f}"
+        if _is_stage3_variant(stage) and "concept_loss" in val_stats:
+            tie_break_text = f" tie=val_concept_loss raw={float(val_stats['concept_loss']):.6f}"
         guard_text = ""
         if _is_stage3_variant(stage) and stage3_concept_guard_enabled:
             threshold_text = (
