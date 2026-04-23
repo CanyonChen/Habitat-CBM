@@ -15,6 +15,21 @@ Habitat-CBM 患者级概念干预脚本。
 - intervention_metrics_by_budget.csv
 - intervention_correction_summary.csv
 - intervention_summary.csv
+
+命令行参数
+python habitat_CBM/repo/srcs/intervene_habitat_cbm.py \
+  --checkpoint habitat_CBM/results/habitat_CBM/20260422_145024/checkpoints/stage3_best.pt \
+  --patient-predictions-csv habitat_CBM/results/habitat_CBM/20260422_145024/patient_predictions_habitat_cbm_20260422_145024.csv \
+  --patient-concepts-csv habitat_CBM/results/habitat_CBM/20260422_145024/patient_concepts_habitat_cbm_20260422_145024.csv \
+  --concept-scaler-json habitat_CBM/dataset/concept_label/concept_scaler_stats.json \
+  --output-dir habitat_CBM/results/05_intervention/20260422_145024 \
+  --split test \
+  --budgets 1,2,3,4,all \
+  --threshold 0.4877892766605344 \
+  --low-confidence-margin 0.1 \
+  --device cuda:0
+
+
 """
 
 from __future__ import annotations
@@ -42,15 +57,27 @@ from models.habitat_CBM import HabitatCBM
 from srcs.data_loader_habitat_CBM import load_concept_scaler, resolve_concept_names
 
 
+_CONCEPT_COLUMN_PATTERN = re.compile(
+    r"[cC](\d+)_(true_std|pred_std|abs_error_std|true_raw|pred_raw|abs_error_raw)"
+)
+_METRICS_SCOPE_SELECTED_SPLIT_ALL = "selected_split_all"
+_METRICS_SCOPE_SELECTED_SPLIT_CANDIDATE = "selected_split_candidate"
+
+
 def _extract_concept_ids_from_row(row: Mapping[str, str]) -> List[str]:
-    matched: List[Tuple[int, str]] = []
+    matched: Dict[int, str] = {}
     for key in row.keys():
-        m = re.fullmatch(r"c(\d+)_abs_error_std", str(key))
+        m = _CONCEPT_COLUMN_PATTERN.fullmatch(str(key))
         if m is None:
             continue
-        matched.append((int(m.group(1)), f"c{int(m.group(1))}"))
-    matched.sort(key=lambda item: item[0])
-    return [item[1] for item in matched]
+        concept_idx = int(m.group(1))
+        matched[concept_idx] = f"c{concept_idx}"
+    if not matched:
+        raise ValueError(
+            "Failed to infer concept ids from concept CSV header. Expected columns like "
+            "c1_true_std/c1_pred_std or c1_true_raw/c1_pred_raw."
+        )
+    return [matched[idx] for idx in sorted(matched.keys())]
 
 
 def _read_csv(path: Path) -> List[Dict[str, str]]:
@@ -410,14 +437,15 @@ def run_intervention(
             if patient_id in candidate_ids:
                 after_prob_candidate.append(prob_after)
 
-        # 全测试口径
+        # 当前选中 split 内的全部患者口径
         after_prob_all_np = np.asarray(after_prob_all, dtype=np.float64)
         metrics_before_all = _compute_metrics_from_prob(y_true_all, prob_before_all, threshold)
         metrics_after_all = _compute_metrics_from_prob(y_true_all, after_prob_all_np, threshold)
 
         budget_metrics_rows.append(
             {
-                "scope": "all",
+                "selected_split": split,
+                "scope": _METRICS_SCOPE_SELECTED_SPLIT_ALL,
                 "budget_k": int(budget_k),
                 "n_patients": int(y_true_all.size),
                 "auc_before": metrics_before_all["auc"],
@@ -434,7 +462,7 @@ def run_intervention(
             }
         )
 
-        # 候选口径
+        # 当前选中 split 内的候选病例口径
         if candidate_ids:
             after_prob_candidate_np = np.asarray(after_prob_candidate, dtype=np.float64)
             metrics_before_candidate = _compute_metrics_from_prob(
@@ -449,7 +477,8 @@ def run_intervention(
             )
             budget_metrics_rows.append(
                 {
-                    "scope": "candidate",
+                    "selected_split": split,
+                    "scope": _METRICS_SCOPE_SELECTED_SPLIT_CANDIDATE,
                     "budget_k": int(budget_k),
                     "n_patients": int(y_true_candidate.size),
                     "auc_before": metrics_before_candidate["auc"],
@@ -482,6 +511,7 @@ def run_intervention(
         correction_rate = float(corrected_count / wrong_count) if wrong_count > 0 else float("nan")
         correction_rows.append(
             {
+                "selected_split": split,
                 "budget_k": int(budget_k),
                 "n_wrong_cases": int(wrong_count),
                 "n_corrected_cases": int(corrected_count),
@@ -492,12 +522,18 @@ def run_intervention(
 
     # summary
     summary_row = {
-        "split": split,
+        "selected_split": split,
         "n_patients_all": int(len(patient_ids)),
         "n_candidates": int(len(candidate_ids)),
         "budgets": "|".join(str(k) for k in budgets),
         "threshold": float(threshold),
         "low_conf_margin": float(low_conf_margin),
+        "metrics_scope_selected_split_all": _METRICS_SCOPE_SELECTED_SPLIT_ALL,
+        "metrics_scope_selected_split_candidate": _METRICS_SCOPE_SELECTED_SPLIT_CANDIDATE,
+        "metrics_scope_note": (
+            "selected_split_all means all patients within the chosen --split; "
+            "use --split all to aggregate train+val+test."
+        ),
         "checkpoint": str(checkpoint_path),
         "patient_predictions_csv": str(patient_predictions_csv),
         "patient_concepts_csv": str(patient_concepts_csv),
@@ -540,6 +576,7 @@ def run_intervention(
     _write_csv(
         output_dir / "intervention_metrics_by_budget.csv",
         [
+            "selected_split",
             "scope",
             "budget_k",
             "n_patients",
@@ -558,6 +595,7 @@ def run_intervention(
     _write_csv(
         output_dir / "intervention_correction_summary.csv",
         [
+            "selected_split",
             "budget_k",
             "n_wrong_cases",
             "n_corrected_cases",
@@ -580,9 +618,20 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--patient-concepts-csv", type=Path, required=True)
     parser.add_argument("--concept-scaler-json", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--split", type=str, default="test", choices=("train", "val", "test", "all"))
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="test",
+        choices=("train", "val", "test", "all"),
+        help="Which split to intervene on. Use all only when you explicitly want train+val+test combined.",
+    )
     parser.add_argument("--budgets", type=str, default="1,2,4,all")
-    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.4877892766605344,
+        help="Probability threshold used to recompute before/after labels. Keep it aligned with the formal evaluation threshold.",
+    )
     parser.add_argument("--low-confidence-margin", type=float, default=0.1)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--in-channels", type=int, default=35)
