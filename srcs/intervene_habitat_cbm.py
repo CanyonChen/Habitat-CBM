@@ -27,6 +27,9 @@ python habitat_CBM/repo/srcs/intervene_habitat_cbm.py \
   --budgets 1,2,3,4,all \
   --threshold 0.4877892766605344 \
   --low-confidence-margin 0.1 \
+  --intervene-scope candidates_only \
+  --ranking logit_effect \
+  --early-stop cross_threshold \
   --device cuda:0
 
 
@@ -39,7 +42,7 @@ import csv
 import json
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence, Set, Tuple
 
 import numpy as np
 import torch
@@ -62,6 +65,12 @@ _CONCEPT_COLUMN_PATTERN = re.compile(
 )
 _METRICS_SCOPE_SELECTED_SPLIT_ALL = "selected_split_all"
 _METRICS_SCOPE_SELECTED_SPLIT_CANDIDATE = "selected_split_candidate"
+_INTERVENE_SCOPE_ALL_PATIENTS = "all_patients"
+_INTERVENE_SCOPE_CANDIDATES_ONLY = "candidates_only"
+_RANKING_ABS_ERROR = "abs_error"
+_RANKING_LOGIT_EFFECT = "logit_effect"
+_EARLY_STOP_NONE = "none"
+_EARLY_STOP_CROSS_THRESHOLD = "cross_threshold"
 
 
 def _extract_concept_ids_from_row(row: Mapping[str, str]) -> List[str]:
@@ -163,6 +172,28 @@ def _parse_budgets(text: str, n_concepts: int) -> List[int]:
     if not values:
         raise ValueError("No valid intervention budgets found.")
     return sorted(set(values))
+
+
+def _parse_concept_whitelist(text: str, available_concept_ids: Sequence[str]) -> List[str]:
+    raw = str(text).strip()
+    if raw == "" or raw.lower() in {"all", "*"}:
+        return list(available_concept_ids)
+
+    available_map = {concept_id.lower(): concept_id for concept_id in available_concept_ids}
+    selected: List[str] = []
+    for token in [item.strip().lower() for item in raw.split(",") if item.strip()]:
+        if token not in available_map:
+            raise ValueError(
+                f"Unknown concept id in --concept-whitelist: {token}. "
+                f"Available concept ids: {list(available_concept_ids)}"
+            )
+        concept_id = available_map[token]
+        if concept_id not in selected:
+            selected.append(concept_id)
+
+    if not selected:
+        raise ValueError("No valid concepts found in --concept-whitelist.")
+    return selected
 
 
 def _build_patient_maps(
@@ -322,6 +353,168 @@ def _load_model_from_checkpoint(
     return model
 
 
+def _extract_label_head_weights(model: HabitatCBM, expected_n_concepts: int) -> np.ndarray:
+    linear_layer = None
+    for module in reversed(list(model.label_head)):
+        if isinstance(module, torch.nn.Linear):
+            linear_layer = module
+            break
+    if linear_layer is None:
+        raise ValueError("Failed to locate the final linear layer in model.label_head.")
+
+    weight = linear_layer.weight.detach().cpu().numpy().reshape(-1)
+    if weight.shape != (expected_n_concepts,):
+        raise ValueError(
+            f"Label-head weight shape mismatch: expected {(expected_n_concepts,)}, got {weight.shape}"
+        )
+    return weight.astype(np.float32, copy=False)
+
+
+def _rank_concept_indices(
+    c_true_std: np.ndarray,
+    c_pred_std: np.ndarray,
+    allowed_indices: Sequence[int],
+    ranking_policy: str,
+    label_head_weights: np.ndarray | None,
+) -> List[int]:
+    delta = np.asarray(c_true_std - c_pred_std, dtype=np.float32)
+    if ranking_policy == _RANKING_ABS_ERROR:
+        scores = np.abs(delta)
+    elif ranking_policy == _RANKING_LOGIT_EFFECT:
+        if label_head_weights is None:
+            raise ValueError("label_head_weights is required when ranking_policy=logit_effect.")
+        scores = np.abs(delta * label_head_weights)
+    else:
+        raise ValueError(f"Unsupported ranking_policy: {ranking_policy}")
+
+    score_masked = np.full_like(scores, fill_value=-np.inf, dtype=np.float32)
+    for idx in allowed_indices:
+        score_masked[int(idx)] = float(scores[int(idx)])
+
+    order = np.argsort(score_masked)[::-1]
+    return [int(idx) for idx in order.tolist() if np.isfinite(score_masked[int(idx)])]
+
+
+def _forward_c_to_prob(model: HabitatCBM, device: torch.device, c_std: np.ndarray) -> float:
+    with torch.no_grad():
+        c_tensor = torch.as_tensor(c_std, dtype=torch.float32, device=device).unsqueeze(0)
+        y_logit = model.forward_c_to_y(c_tensor)
+        return float(torch.sigmoid(y_logit).item())
+
+
+def _intervene_single_patient(
+    *,
+    patient_id: str,
+    item: Mapping[str, object],
+    concept_ids: Sequence[str],
+    allowed_concept_ids: Sequence[str],
+    candidate_id_set: Set[str],
+    intervene_scope: str,
+    ranking_policy: str,
+    label_head_weights: np.ndarray | None,
+    early_stop_mode: str,
+    budget_k: int,
+    threshold: float,
+    model: HabitatCBM,
+    device: torch.device,
+) -> Dict[str, object]:
+    y_true = int(item["y_true"])
+    pred_before = int(item["pred_before"])
+    prob_before = float(item["prob_before"])
+
+    should_intervene = (
+        intervene_scope == _INTERVENE_SCOPE_ALL_PATIENTS
+        or patient_id in candidate_id_set
+    )
+    if not should_intervene:
+        return {
+            "prob_after": prob_before,
+            "pred_after": pred_before,
+            "concepts_replaced": "",
+            "n_concepts_replaced": 0,
+            "corrected_flag": 0,
+            "intervention_applied": 0,
+            "stop_reason": "not_selected_by_scope",
+        }
+
+    allowed_concept_id_set = set(allowed_concept_ids)
+    allowed_indices = [
+        idx for idx, concept_id in enumerate(concept_ids) if concept_id in allowed_concept_id_set
+    ]
+    if not allowed_indices:
+        return {
+            "prob_after": prob_before,
+            "pred_after": pred_before,
+            "concepts_replaced": "",
+            "n_concepts_replaced": 0,
+            "corrected_flag": 0,
+            "intervention_applied": 0,
+            "stop_reason": "no_allowed_concepts",
+        }
+
+    if early_stop_mode == _EARLY_STOP_CROSS_THRESHOLD and pred_before == y_true:
+        return {
+            "prob_after": prob_before,
+            "pred_after": pred_before,
+            "concepts_replaced": "",
+            "n_concepts_replaced": 0,
+            "corrected_flag": 0,
+            "intervention_applied": 0,
+            "stop_reason": "already_correct_before",
+        }
+
+    c_true_std = np.asarray(item["c_true_std"], dtype=np.float32)
+    c_pred_std = np.asarray(item["c_pred_std"], dtype=np.float32)
+    ranked_indices = _rank_concept_indices(
+        c_true_std=c_true_std,
+        c_pred_std=c_pred_std,
+        allowed_indices=allowed_indices,
+        ranking_policy=ranking_policy,
+        label_head_weights=label_head_weights,
+    )
+    if not ranked_indices:
+        return {
+            "prob_after": prob_before,
+            "pred_after": pred_before,
+            "concepts_replaced": "",
+            "n_concepts_replaced": 0,
+            "corrected_flag": 0,
+            "intervention_applied": 0,
+            "stop_reason": "no_ranked_concepts",
+        }
+
+    max_steps = min(int(budget_k), len(ranked_indices))
+    c_after = c_pred_std.copy()
+    replaced_indices: List[int] = []
+    prob_after = prob_before
+    pred_after = pred_before
+    stop_reason = "budget_exhausted"
+
+    for concept_idx in ranked_indices[:max_steps]:
+        c_after[int(concept_idx)] = c_true_std[int(concept_idx)]
+        prob_after = _forward_c_to_prob(model=model, device=device, c_std=c_after)
+        pred_after = int(prob_after >= threshold)
+        replaced_indices.append(int(concept_idx))
+
+        if early_stop_mode == _EARLY_STOP_CROSS_THRESHOLD and pred_after == y_true:
+            stop_reason = "crossed_to_correct_side"
+            break
+
+    corrected_flag = int(pred_before != y_true and pred_after == y_true)
+    if not replaced_indices:
+        stop_reason = "no_change_applied"
+
+    return {
+        "prob_after": prob_after,
+        "pred_after": pred_after,
+        "concepts_replaced": "|".join(concept_ids[idx] for idx in replaced_indices),
+        "n_concepts_replaced": len(replaced_indices),
+        "corrected_flag": corrected_flag,
+        "intervention_applied": int(bool(replaced_indices)),
+        "stop_reason": stop_reason,
+    }
+
+
 def run_intervention(
     checkpoint_path: Path,
     patient_predictions_csv: Path,
@@ -332,6 +525,10 @@ def run_intervention(
     budgets_text: str,
     threshold: float,
     low_conf_margin: float,
+    intervene_scope: str,
+    ranking_policy: str,
+    concept_whitelist_text: str,
+    early_stop_mode: str,
     device_name: str,
     in_channels: int,
     n_concepts: int,
@@ -356,7 +553,11 @@ def run_intervention(
         fallback_in_channels=in_channels,
         fallback_n_concepts=n_concepts,
     )
-
+    label_head_weights = _extract_label_head_weights(model, expected_n_concepts=n_concepts_from_data)
+    allowed_concept_ids = _parse_concept_whitelist(
+        concept_whitelist_text,
+        available_concept_ids=concept_ids,
+    )
     # 候选样本 = 误判 OR 低置信度
     candidate_rows: List[Dict[str, object]] = []
     for patient_id in patient_ids:
@@ -386,6 +587,7 @@ def run_intervention(
     prob_before_all = np.asarray([float(patient_map[pid]["prob_before"]) for pid in patient_ids], dtype=np.float64)
 
     candidate_ids = [row["patient_id"] for row in candidate_rows]
+    candidate_id_set = set(candidate_ids)
     y_true_candidate = np.asarray([int(patient_map[pid]["y_true"]) for pid in candidate_ids], dtype=np.int64)
     prob_before_candidate = np.asarray(
         [float(patient_map[pid]["prob_before"]) for pid in candidate_ids], dtype=np.float64
@@ -399,35 +601,40 @@ def run_intervention(
 
         for patient_id in patient_ids:
             item = patient_map[patient_id]
-            c_true_std = np.asarray(item["c_true_std"], dtype=np.float32)
-            c_pred_std = np.asarray(item["c_pred_std"], dtype=np.float32)
-            order = np.argsort(np.abs(c_pred_std - c_true_std))[::-1]
-
-            k_eff = min(budget_k, c_true_std.shape[0])
-            replace_idx = order[:k_eff]
-            c_after = c_pred_std.copy()
-            c_after[replace_idx] = c_true_std[replace_idx]
-
-            with torch.no_grad():
-                c_after_tensor = torch.as_tensor(c_after, dtype=torch.float32, device=device).unsqueeze(0)
-                y_logit_after = model.forward_c_to_y(c_after_tensor)
-                prob_after = float(torch.sigmoid(y_logit_after).item())
+            patient_result = _intervene_single_patient(
+                patient_id=patient_id,
+                item=item,
+                concept_ids=concept_ids,
+                allowed_concept_ids=allowed_concept_ids,
+                candidate_id_set=candidate_id_set,
+                intervene_scope=intervene_scope,
+                ranking_policy=ranking_policy,
+                label_head_weights=label_head_weights,
+                early_stop_mode=early_stop_mode,
+                budget_k=budget_k,
+                threshold=threshold,
+                model=model,
+                device=device,
+            )
 
             pred_before = int(item["pred_before"])
-            pred_after = int(prob_after >= threshold)
-            corrected = int(pred_before != int(item["y_true"]) and pred_after == int(item["y_true"]))
+            pred_after = int(patient_result["pred_after"])
+            prob_after = float(patient_result["prob_after"])
 
             row = {
                 "patient_id": patient_id,
                 "split": item["split"],
                 "y_true": int(item["y_true"]),
                 "budget_k": int(budget_k),
-                "concepts_replaced": "|".join(concept_ids[int(idx)] for idx in replace_idx.tolist()),
+                "concepts_replaced": str(patient_result["concepts_replaced"]),
+                "n_concepts_replaced": int(patient_result["n_concepts_replaced"]),
                 "prob_before": float(item["prob_before"]),
                 "prob_after": prob_after,
                 "pred_before": pred_before,
                 "pred_after": pred_after,
-                "corrected_flag": corrected,
+                "corrected_flag": int(patient_result["corrected_flag"]),
+                "intervention_applied": int(patient_result["intervention_applied"]),
+                "stop_reason": str(patient_result["stop_reason"]),
                 "run_id": item["run_id"],
                 "checkpoint_name": item["checkpoint_name"],
             }
@@ -446,6 +653,10 @@ def run_intervention(
             {
                 "selected_split": split,
                 "scope": _METRICS_SCOPE_SELECTED_SPLIT_ALL,
+                "intervene_scope": intervene_scope,
+                "ranking_policy": ranking_policy,
+                "early_stop_mode": early_stop_mode,
+                "concept_whitelist": "|".join(allowed_concept_ids),
                 "budget_k": int(budget_k),
                 "n_patients": int(y_true_all.size),
                 "auc_before": metrics_before_all["auc"],
@@ -479,6 +690,10 @@ def run_intervention(
                 {
                     "selected_split": split,
                     "scope": _METRICS_SCOPE_SELECTED_SPLIT_CANDIDATE,
+                    "intervene_scope": intervene_scope,
+                    "ranking_policy": ranking_policy,
+                    "early_stop_mode": early_stop_mode,
+                    "concept_whitelist": "|".join(allowed_concept_ids),
                     "budget_k": int(budget_k),
                     "n_patients": int(y_true_candidate.size),
                     "auc_before": metrics_before_candidate["auc"],
@@ -503,20 +718,45 @@ def run_intervention(
             row
             for row in per_case_rows
             if int(row["budget_k"]) == int(budget_k)
-            and str(row["patient_id"]) in set(candidate_ids)
+            and str(row["patient_id"]) in candidate_id_set
             and int(row["pred_before"]) != int(row["y_true"])
         ]
         wrong_count = len(wrong_candidate_rows)
         corrected_count = sum(int(row["corrected_flag"]) for row in wrong_candidate_rows)
         correction_rate = float(corrected_count / wrong_count) if wrong_count > 0 else float("nan")
+        avg_actual_intervened_wrong = (
+            float(np.mean([int(row["n_concepts_replaced"]) for row in wrong_candidate_rows]))
+            if wrong_candidate_rows
+            else float("nan")
+        )
+        avg_actual_intervened_candidates = (
+            float(
+                np.mean(
+                    [
+                        int(row["n_concepts_replaced"])
+                        for row in per_case_rows
+                        if int(row["budget_k"]) == int(budget_k)
+                        and str(row["patient_id"]) in candidate_id_set
+                    ]
+                )
+            )
+            if candidate_id_set
+            else float("nan")
+        )
         correction_rows.append(
             {
                 "selected_split": split,
+                "intervene_scope": intervene_scope,
+                "ranking_policy": ranking_policy,
+                "early_stop_mode": early_stop_mode,
+                "concept_whitelist": "|".join(allowed_concept_ids),
                 "budget_k": int(budget_k),
                 "n_wrong_cases": int(wrong_count),
                 "n_corrected_cases": int(corrected_count),
                 "correction_rate": correction_rate,
-                "avg_intervened_concepts": float(min(budget_k, n_concepts_from_data)),
+                "avg_planned_budget_concepts": float(min(budget_k, n_concepts_from_data)),
+                "avg_actual_intervened_concepts_wrong_cases": avg_actual_intervened_wrong,
+                "avg_actual_intervened_concepts_all_candidates": avg_actual_intervened_candidates,
             }
         )
 
@@ -528,6 +768,11 @@ def run_intervention(
         "budgets": "|".join(str(k) for k in budgets),
         "threshold": float(threshold),
         "low_conf_margin": float(low_conf_margin),
+        "intervene_scope": intervene_scope,
+        "ranking_policy": ranking_policy,
+        "early_stop_mode": early_stop_mode,
+        "concept_whitelist": "|".join(allowed_concept_ids),
+        "n_allowed_concepts": int(len(allowed_concept_ids)),
         "metrics_scope_selected_split_all": _METRICS_SCOPE_SELECTED_SPLIT_ALL,
         "metrics_scope_selected_split_candidate": _METRICS_SCOPE_SELECTED_SPLIT_CANDIDATE,
         "metrics_scope_note": (
@@ -563,11 +808,14 @@ def run_intervention(
             "y_true",
             "budget_k",
             "concepts_replaced",
+            "n_concepts_replaced",
             "prob_before",
             "prob_after",
             "pred_before",
             "pred_after",
             "corrected_flag",
+            "intervention_applied",
+            "stop_reason",
             "run_id",
             "checkpoint_name",
         ],
@@ -578,6 +826,10 @@ def run_intervention(
         [
             "selected_split",
             "scope",
+            "intervene_scope",
+            "ranking_policy",
+            "early_stop_mode",
+            "concept_whitelist",
             "budget_k",
             "n_patients",
             "auc_before",
@@ -596,11 +848,17 @@ def run_intervention(
         output_dir / "intervention_correction_summary.csv",
         [
             "selected_split",
+            "intervene_scope",
+            "ranking_policy",
+            "early_stop_mode",
+            "concept_whitelist",
             "budget_k",
             "n_wrong_cases",
             "n_corrected_cases",
             "correction_rate",
-            "avg_intervened_concepts",
+            "avg_planned_budget_concepts",
+            "avg_actual_intervened_concepts_wrong_cases",
+            "avg_actual_intervened_concepts_all_candidates",
         ],
         correction_rows,
     )
@@ -633,6 +891,33 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Probability threshold used to recompute before/after labels. Keep it aligned with the formal evaluation threshold.",
     )
     parser.add_argument("--low-confidence-margin", type=float, default=0.1)
+    parser.add_argument(
+        "--intervene-scope",
+        type=str,
+        default=_INTERVENE_SCOPE_CANDIDATES_ONLY,
+        choices=(_INTERVENE_SCOPE_ALL_PATIENTS, _INTERVENE_SCOPE_CANDIDATES_ONLY),
+        help="Who will actually be modified. candidates_only is safer because non-candidate patients stay unchanged.",
+    )
+    parser.add_argument(
+        "--ranking",
+        type=str,
+        default=_RANKING_LOGIT_EFFECT,
+        choices=(_RANKING_ABS_ERROR, _RANKING_LOGIT_EFFECT),
+        help="How to choose which concept to fix first. logit_effect prefers concepts that matter more to the final prediction.",
+    )
+    parser.add_argument(
+        "--concept-whitelist",
+        type=str,
+        default="",
+        help="Optional comma-separated concept ids to allow intervention on, e.g. c3 or c3,c6. Empty means all available concepts.",
+    )
+    parser.add_argument(
+        "--early-stop",
+        type=str,
+        default=_EARLY_STOP_CROSS_THRESHOLD,
+        choices=(_EARLY_STOP_NONE, _EARLY_STOP_CROSS_THRESHOLD),
+        help="Whether to stop once the patient reaches the correct side of the threshold. cross_threshold also leaves already-correct patients unchanged.",
+    )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--in-channels", type=int, default=35)
     parser.add_argument("--n-concepts", type=int, default=8)
@@ -651,6 +936,10 @@ def main() -> None:
         budgets_text=args.budgets,
         threshold=args.threshold,
         low_conf_margin=args.low_confidence_margin,
+        intervene_scope=args.intervene_scope,
+        ranking_policy=args.ranking,
+        concept_whitelist_text=args.concept_whitelist,
+        early_stop_mode=args.early_stop,
         device_name=args.device,
         in_channels=args.in_channels,
         n_concepts=args.n_concepts,
