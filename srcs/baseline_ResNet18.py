@@ -85,9 +85,9 @@ ResNet-18 基线训练脚本，用于病人级别的 IDH 突变状态预测。
 
 --min-nonzero-voxels (int)
     一个中心切片被保留为有效样本时，至少需要多少个前景体素。
-    默认值: 32
+    默认值: 16
     说明: 当启用 VOI 时，按 VOI 的非零体素数计算；否则按参考模态的非零体素数计算。
-          默认值从 16 提升至 32，过滤 VOI 区域极小的低质量切片，提升训练样本信噪比。
+          默认值 16，与 CBM Stage1 min_nonzero_voxels=16 对齐。
 
 --cache-volumes (bool)
     是否缓存体数据到内存，减少重复 IO。
@@ -100,30 +100,30 @@ ResNet-18 基线训练脚本，用于病人级别的 IDH 突变状态预测。
 --batch-size (int)
     训练和评估时 DataLoader 的 batch size。
     默认值: 32
-    说明: 根据 GPU 显存调整，常见值: 4, 8, 16, 32。
+    说明: 与 CBM Stage1 batch_size=32 对齐。根据 GPU 显存调整，常见值: 4, 8, 16, 32。
 
 --epochs (int)
     最大训练轮数。
-    默认值: 200
-    说明: 实际训练可能在达到此值前因早停而结束。
+    默认值: 100
+    说明: 与 CBM Stage1 epochs=100 对齐。实际训练可能在达到此值前因早停而结束。
 
 --lr (float)
     AdamW 优化器的学习率。
-    默认值: 5e-6
+    默认值: 1e-5
     可用范围: 建议 1e-6 ~ 1e-4
-    说明: 从 2e-5 进一步降低到 5e-6，减缓 fc 层参数更新速度，缓解 best_epoch=3 的极早期过拟合。
-          配合 ReduceLROnPlateau，plateau 触发后 lr 可进一步降至 2.5e-6。
+    说明: 与 CBM Stage1 lr_encoder=1e-5 / lr_concept_head=1e-5 对齐。
+          配合 ReduceLROnPlateau，plateau 触发后 lr 可进一步降低。
 
 --weight-decay (float)
     AdamW 的权重衰减系数（L2 正则化）。
-    默认值: 1e-3
+    默认值: 5e-3
     可用范围: 建议 1e-4 ~ 1e-2
-    说明: 提升至 1e-3 可增强正则化强度，有效抑制过拟合。
+    说明: 与 CBM Stage1 weight_decay=0.005 对齐。
 
 --num-workers (int)
     DataLoader 使用的并行加载进程数。
-    默认值: 16
-    说明: 设为 0 表示在主进程加载；建议根据 CPU 核心数调整。
+    默认值: 4
+    说明: 与 CBM Stage1 num_workers=4 对齐。设为 0 表示在主进程加载。
 
 --seed (int)
     全局随机种子，用于保证实验可复现。
@@ -153,17 +153,16 @@ ResNet-18 基线训练脚本，用于病人级别的 IDH 突变状态预测。
 
 --early-stop-patience (int)
     验证集 AUC 连续多少个 epoch 没有提升时触发早停。
-    默认值: 20
-    说明: 设为 0 可禁用早停；14 人验证集的 AUC 最小分辨率约 0.0156，
-          patience=5 会过早停止，建议使用 15 ~ 30。
+    默认值: 100
+    说明: 与 CBM Stage1 early_stop_patience=100 对齐，实际上禁用了早停，
+          给 lr scheduler 充足的退火空间。设为 0 可禁用早停。
 
 --early-stop-min-delta (float)
     判定为"有效提升"的最小阈值（验证集监控指标的提升幅度）。
-    默认值: 0.005
+    默认值: 0.002
     可用范围: [0.0, 1.0]
-    说明: 只有当验证集 AUC 的提升 > min_delta 时，才认为是有效改进。
-          14 人验证集 AUC 最小分辨率 ≈ 0.0156，将 delta 设为 0.005 相当于
-          要求改进超过最小单位的 1/3，既能过滤随机波动又不过于严苛。
+    说明: 与 CBM Stage1 early_stop_min_delta=0.002 对齐。
+          只有当验证集 AUC 的提升 > min_delta 时，才认为是有效改进。
           设为 0 则任何提升都算改进。
 
 --save-train-predictions (bool)
@@ -212,40 +211,37 @@ ResNet-18 基线训练脚本，用于病人级别的 IDH 突变状态预测。
 
 --dropout-p (float)
     ResNet-18 分类头前 Dropout 层的 dropout 概率。
-    默认值: 0.7
+    默认值: 0.4
     可用范围: [0.0, 1.0)
-    说明: 设为 0.0 则不添加 Dropout 层；对于训练块数远多于验证患者数的情况
-          （如约 6000 blocks vs 14 名患者），Dropout 可显著抑制过拟合。
-          建议范围: 0.5 ~ 0.7。
+    说明: 与 CBM Stage1 concept_dropout_p=0.4 对齐。
+          设为 0.0 则不添加 Dropout 层。
 
 --freeze-layers (str)
     冻结 ResNet-18 backbone 中哪些层（不参与反向传播），用逗号分隔。
     可用选项: none, conv1, layer1, layer2, layer3, layer4
-    默认值: conv1,layer1,layer2,layer3,layer4
-    说明: 冻结早期层可大幅减少可训练参数量，是小样本场景下最有效的正则化手段之一。
+    默认值: layer1,layer2
+    说明: 与 CBM Stage1 freeze_encoder_layers=[layer1,layer2] 对齐。
+          冻结早期层可减少可训练参数量；layer3/layer4 保持可训练。
           - none: 不冻结任何层，全量微调（容易过拟合）；
-          - conv1,layer1,layer2,layer3: 只训练 layer4 + fc，参数量 ~2.7M；
-          - conv1,layer1,layer2,layer3,layer4（默认）: 只训练 fc，参数量 ~1K，
-            最大程度抑制小样本过拟合；若 Val AUC 低于 0.75，可回退到 layer3。
+          - layer1,layer2（默认）: 只冻结浅层，允许 layer3/layer4 + fc 适配，
+            trainable 参数约 ~2.7M。
 
 --label-smoothing (float)
     CrossEntropyLoss 的 label smoothing 系数。
-    默认值: 0.3
+    默认值: 0.0
     可用范围: [0.0, 0.4)
-    说明: 将 one-hot 标签软化为 (1 - ε) 和 ε / (C-1)，防止模型过于自信；
-          从 0.2 提升至 0.3，进一步抑制 train AUC=0.9995 的极度自信预测。
-          不建议超过 0.4，否则模型无法有效区分类别。设为 0.0 则使用标准交叉熵。
+    说明: 与 CBM Stage1 label_smoothing=0.0 对齐，使用标准交叉熵训练目标。
+          设为大于 0 的值时会将 one-hot 标签向 0.5 轻微移动。
 
 --lr-scheduler (str)
     学习率调度策略。
-    默认值: cosine
+    默认值: plateau
     可用选项:
       none   - 不使用调度器，学习率全程固定。
       cosine - CosineAnnealingLR，将 lr 从初始值余弦退火至 eta_min=1e-6。
                适合大多数场景，训练后期平滑降低 lr 避免震荡。
-      plateau - ReduceLROnPlateau(mode='max', factor=0.5, patience=5)，
-                当验证 AUC 连续 5 epoch 没有提升时，将 lr 缩减为原来的 50%。
-                适合训练曲线震荡较大的情况。
+      plateau - ReduceLROnPlateau(mode='max', factor=0.5, patience=8)，
+                与 CBM Stage1 scheduler 对齐，连续 8 epoch 没有提升时将 lr 缩减为 50%。
 
 ================================================================================
 Checkpoint 保存策略
@@ -590,11 +586,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-nonzero-voxels",
         type=int,
-        default=32,
+        default=16,
         help=(
             "Minimum foreground voxels required for a center slice; when VOI is enabled this is "
-            "counted on functional/voi. Default 32 (increased from 16) filters out near-empty slices "
-            "with very small VOI regions that carry little tumor information, improving sample quality."
+            "counted on functional/voi. Default 16, aligned with CBM Stage1 min_nonzero_voxels=16."
         ),
     )
     parser.add_argument("--cache-volumes", type=str2bool, default=True, help="Cache volumes.")
@@ -682,25 +677,26 @@ def build_argparser() -> argparse.ArgumentParser:
         default=0.5,
         help="Upper bound of the Gibbs noise alpha range [0, alpha] used by RandGibbsNoised.",
     )
-    parser.add_argument("--batch-size", type=int, default=16, help="Mini-batch size.")
-    parser.add_argument("--epochs", type=int, default=200, help="Training epochs.")
+    parser.add_argument("--batch-size", type=int, default=32, help="Mini-batch size.")
+    parser.add_argument("--epochs", type=int, default=100, help="Training epochs.")
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-4,
+        default=1e-5,
         help=(
-            "AdamW learning rate. Default 5e-6 (reduced from 2e-5) further slows down learning to "
-            "mitigate extreme early overfitting (best_epoch=3) on small medical image datasets. "
-            "With layerwise lr_mult=0.1, backbone layer4 lr=5e-7, head lr=5e-6."
+            "AdamW learning rate. Default 1e-5, aligned with CBM Stage1 lr_encoder=1e-5 / "
+            "lr_concept_head=1e-5. With layerwise lr_mult=0.1, backbone layer4 lr=1e-6, "
+            "head lr=1e-5."
         ),
     )
     parser.add_argument(
         "--weight-decay",
         type=float,
-        default=1e-2,
+        default=5e-3,
         help=(
-            "AdamW weight decay (L2 regularization). Default 1e-2 (increased from 1e-3) for "
-            "stronger regularization on small datasets (~56 training patients)."
+            "AdamW weight decay (L2 regularization). Default 5e-3, aligned with CBM Stage1 "
+            "weight_decay=0.005. Slightly relaxed compared to a stricter 1e-2 to give the "
+            "classification head more freedom on small datasets (~56 training patients)."
         ),
     )
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers.")
@@ -714,14 +710,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--freeze-layers",
         type=str,
-        default="conv1,layer1,layer2,layer3,layer4",
+        default="layer1,layer2",
         help=(
             "Comma-separated list of ResNet-18 layers to freeze (no gradient). "
             "Valid names: none, conv1, bn1, layer1, layer2, layer3, layer4. "
             "Use 'none' to disable freezing (full fine-tuning). "
-            "Default 'conv1,layer1,layer2,layer3,layer4' freezes the entire backbone, only trains fc "
-            "reducing trainable params from ~11M to ~1K — maximally suppresses overfitting for "
-            "small datasets (~96 patients). If val AUC drops below 0.75, relax to layer3 only."
+            "Default 'layer1,layer2' (aligned with CBM Stage1 freeze_encoder_layers) freezes the "
+            "early backbone layers while allowing layer3/layer4 to adapt (~2.7M trainable params), "
+            "providing enough model capacity for IDH classification."
         ),
     )
     parser.add_argument(
@@ -745,42 +741,44 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--early-stop-patience",
         type=int,
-        default=10,
+        default=100,
         help=(
             "Stop if validation AUC does not improve for N epochs. "
-            "Default 30 (increased from 20) gives the model more time to escape from early overfitting "
-            "and find a better generalization point."
+            "Default 100 (aligned with CBM Stage1 global early_stop_patience=100), effectively "
+            "disabling early stopping and giving the lr scheduler full room to anneal. "
+            "Set to 0 to disable; 14-patient val set AUC resolution ~0.0156 means short "
+            "plateaus do not indicate true stagnation."
         ),
     )
     parser.add_argument(
         "--early-stop-min-delta",
         type=float,
-        default=0.0,
+        default=0.002,
         help=(
             "Minimum change in validation score to qualify as an improvement for early stopping. "
-            "Default 0.0 (reduced from 0.005): any improvement counts, since with strong regularization "
-            "the model may improve only marginally per epoch."
+            "Default 0.002, aligned with CBM Stage1 early_stop_min_delta=0.002: requires a "
+            "meaningful AUC gain beyond random noise before resetting the patience counter."
         ),
     )
     parser.add_argument(
         "--dropout-p",
         type=float,
-        default=0.7,
+        default=0.4,
         help=(
             "Dropout probability applied before the final classification layer. "
-            "0.0 disables Dropout. Default 0.7 (increased from 0.5) for stronger regularization "
+            "0.0 disables Dropout. Default 0.4, aligned with CBM Stage1 concept_dropout_p=0.4: "
+            "moderately regularizes the classification head without over-suppressing feature signals "
             "when training blocks (~6000) greatly outnumber validation patients (~14)."
         ),
     )
     parser.add_argument(
         "--label-smoothing",
         type=float,
-        default=0.3,
+        default=0.0,
         help=(
             "Label smoothing coefficient for CrossEntropyLoss (0.0 = standard cross-entropy). "
-            "Default 0.3 (increased from 0.2) softens one-hot targets more aggressively "
-            "to prevent overconfident predictions (train AUC=0.9995) on small datasets. "
-            "Do not exceed 0.4 to avoid losing discriminative capacity."
+            "Default 0.0, aligned with CBM Stage1 label_smoothing=0.0: no label smoothing is "
+            "applied, keeping the training objective straightforward for IDH binary classification."
         ),
     )
     parser.add_argument(
@@ -1963,10 +1961,10 @@ def _main_training_loop(
             optimizer,
             mode="max",       # 监控指标越大越好（val AUC）
             factor=0.5,       # lr 乘以 0.5
-            patience=5,       # 连续 5 epoch 没有改进才降低 lr
+            patience=8,       # 连续 8 epoch 没有改进才降低 lr，aligned with CBM Stage1 scheduler.patience=8
             min_lr=1e-6,
         )
-        print("LR scheduler: ReduceLROnPlateau (mode=max, factor=0.5, patience=5, min_lr=1e-6)")
+        print("LR scheduler: ReduceLROnPlateau (mode=max, factor=0.5, patience=8, min_lr=1e-6)")
     else:
         print("LR scheduler: none (constant learning rate)")
 
