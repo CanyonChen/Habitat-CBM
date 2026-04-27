@@ -1,0 +1,6 @@
+# Dependencies for labs/repo/srcs/statistical_validation.py
+# This file intentionally excludes training and medical-image dependencies.
+numpy>=1.24,<3.0
+pandas>=2.0,<3.0
+scipy>=1.10,<2.0
+scikit-learn>=1.3,<2.0
