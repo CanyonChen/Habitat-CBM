@@ -17,12 +17,12 @@ Habitat-CBM 患者级概念干预脚本。
 - intervention_summary.csv
 
 命令行参数
-python habitat_CBM/repo/srcs/intervene_habitat_cbm.py \
-  --checkpoint habitat_CBM/results/habitat_CBM/20260422_145024/checkpoints/stage3_best.pt \
-  --patient-predictions-csv habitat_CBM/results/habitat_CBM/20260422_145024/patient_predictions_habitat_cbm_20260422_145024.csv \
-  --patient-concepts-csv habitat_CBM/results/habitat_CBM/20260422_145024/patient_concepts_habitat_cbm_20260422_145024.csv \
-  --concept-scaler-json habitat_CBM/dataset/concept_label/concept_scaler_stats.json \
-  --output-dir habitat_CBM/results/05_intervention/20260422_145024 \
+python /root/autodl-tmp/habitat_CBM/repo/srcs/intervene_habitat_cbm.py \
+  --checkpoint /root/autodl-tmp/habitat_CBM/results/habitat_CBM/20260422_145024/checkpoints/stage3_best.pt \
+  --patient-predictions-csv /root/autodl-tmp/habitat_CBM/results/habitat_CBM/20260422_145024/patient_predictions_habitat_cbm_20260422_145024.csv \
+  --patient-concepts-csv /root/autodl-tmp/habitat_CBM/results/habitat_CBM/20260422_145024/patient_concepts_habitat_cbm_20260422_145024.csv \
+  --concept-scaler-json /root/autodl-tmp/habitat_CBM/dataset/concept_label/concept_scaler_stats.json \
+  --output-dir /root/autodl-tmp/habitat_CBM/results/intervention/20260422_145024_v2 \
   --split test \
   --budgets 1,2,3,4,all \
   --threshold 0.4877892766605344 \
@@ -30,7 +30,7 @@ python habitat_CBM/repo/srcs/intervene_habitat_cbm.py \
   --intervene-scope candidates_only \
   --ranking logit_effect \
   --early-stop cross_threshold \
-  --device cuda:0
+  --device cuda
 
 
 """

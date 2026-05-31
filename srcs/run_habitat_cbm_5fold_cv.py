@@ -112,7 +112,7 @@ def _repo_relative_or_base(default_path: Path, fallback: Path) -> Path:
 
 def _infer_dataset_root(base_cfg: Mapping[str, object]) -> Path:
     local_dataset = PROJECT_ROOT / "dataset"
-    if (local_dataset / "idh.csv").exists():
+    if (local_dataset / "idh.csv").exists() or (local_dataset / "images" / "idh.csv").exists():
         return local_dataset
 
     paths_cfg = _as_dict(base_cfg.get("paths", {}), name="paths")

@@ -405,7 +405,24 @@ def load_nifti_array(path: Path) -> np.ndarray:
     """读取单个医学影像文件并返回 float32 数组。
 
     这里统一转为 `float32`，以便后续归一化与 PyTorch 张量化。
+    兼容处理：扩展名为 .gz 但实际未压缩的 NIfTI 文件。
     """
+    import io
+
+    path = Path(path)
+
+    if path.suffix == ".gz":
+        with open(path, "rb") as _f:
+            magic = _f.read(2)
+        if magic != b"\x1f\x8b":
+            # 文件是未压缩的 NIfTI 但扩展名为 .gz，用 BytesIO 绕过 nibabel 的扩展名检测
+            with open(path, "rb") as _f:
+                raw = _f.read()
+            fobj = io.BytesIO(raw)
+            fh = nib.FileHolder(fileobj=fobj)
+            image = nib.Nifti1Image.from_file_map({"header": fh, "image": fh})
+            array = image.get_fdata(dtype=np.float32)
+            return np.asarray(array, dtype=np.float32)
 
     image = nib.load(str(path))
     array = image.get_fdata(dtype=np.float32)
