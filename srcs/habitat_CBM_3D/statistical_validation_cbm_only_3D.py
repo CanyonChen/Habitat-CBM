@@ -18,9 +18,26 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+try:
+    from sklearn.metrics import accuracy_score as _sk_accuracy_score
+    from sklearn.metrics import confusion_matrix as _sk_confusion_matrix
+    from sklearn.metrics import f1_score as _sk_f1_score
+    from sklearn.metrics import roc_auc_score as _sk_roc_auc_score
+    from sklearn.metrics import roc_curve as _sk_roc_curve
+
+    SKLEARN_METRICS_AVAILABLE = True
+except Exception:  # pragma: no cover - local fallback only
+    _sk_accuracy_score = None
+    _sk_confusion_matrix = None
+    _sk_f1_score = None
+    _sk_roc_auc_score = None
+    _sk_roc_curve = None
+    SKLEARN_METRICS_AVAILABLE = False
+
 
 REQUIRED_COLUMNS = ("patient_id", "y_true", "prob_idh_mut", "pred_label")
 METRIC_ORDER = ("auc", "acc", "sen", "spe", "f1")
+METRICS_BACKEND = "sklearn" if SKLEARN_METRICS_AVAILABLE else "numpy_fallback"
 
 
 @dataclass(frozen=True)
@@ -126,6 +143,9 @@ def _safe_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     n_neg = int((y_true == 0).sum())
     if n_pos == 0 or n_neg == 0:
         return float("nan")
+    if SKLEARN_METRICS_AVAILABLE:
+        assert _sk_roc_auc_score is not None
+        return float(_sk_roc_auc_score(y_true, y_prob))
     ranks = _average_ranks(y_prob)
     sum_pos_ranks = float(ranks[y_true == 1].sum())
     u_stat = sum_pos_ranks - n_pos * (n_pos + 1) / 2.0
@@ -149,20 +169,34 @@ def _average_ranks(values: np.ndarray) -> np.ndarray:
 
 
 def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    tn = int(np.sum((y_true == 0) & (y_pred == 0)))
-    fp = int(np.sum((y_true == 0) & (y_pred == 1)))
-    fn = int(np.sum((y_true == 1) & (y_pred == 0)))
-    tp = int(np.sum((y_true == 1) & (y_pred == 1)))
-    n = int(y_true.shape[0])
+    if SKLEARN_METRICS_AVAILABLE:
+        assert _sk_accuracy_score is not None
+        assert _sk_confusion_matrix is not None
+        assert _sk_f1_score is not None
+        tn, fp, fn, tp = _sk_confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+        tn = int(tn)
+        fp = int(fp)
+        fn = int(fn)
+        tp = int(tp)
+        acc = float(_sk_accuracy_score(y_true, y_pred))
+        f1 = float(_sk_f1_score(y_true, y_pred, zero_division=0))
+    else:
+        tn = int(np.sum((y_true == 0) & (y_pred == 0)))
+        fp = int(np.sum((y_true == 0) & (y_pred == 1)))
+        fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+        tp = int(np.sum((y_true == 1) & (y_pred == 1)))
+        n = int(y_true.shape[0])
+        acc = float((tp + tn) / n) if n else float("nan")
+        f1_denominator = 2 * tp + fp + fn
+        f1 = float((2 * tp) / f1_denominator) if f1_denominator else 0.0
     sen = float(tp / (tp + fn)) if (tp + fn) else float("nan")
     spe = float(tn / (tn + fp)) if (tn + fp) else float("nan")
-    f1_denominator = 2 * tp + fp + fn
     return {
         "auc": _safe_auc(y_true, y_prob),
-        "acc": float((tp + tn) / n) if n else float("nan"),
+        "acc": acc,
         "sen": sen,
         "spe": spe,
-        "f1": float((2 * tp) / f1_denominator) if f1_denominator else 0.0,
+        "f1": f1,
         "tn": float(tn),
         "fp": float(fp),
         "fn": float(fn),
@@ -260,6 +294,7 @@ def build_metric_row(
     row: Dict[str, Any] = {
         "model": model_name,
         "split": table.split,
+        "metrics_backend": METRICS_BACKEND,
         "n": int(table.y_true.shape[0]),
         "n_negative": int((table.y_true == 0).sum()),
         "n_positive": int((table.y_true == 1).sum()),
@@ -284,6 +319,18 @@ def build_metric_row(
 def build_roc_rows(table: PredictionTable) -> List[Dict[str, float]]:
     if np.unique(table.y_true).size < 2:
         return []
+    if SKLEARN_METRICS_AVAILABLE:
+        assert _sk_roc_curve is not None
+        fpr, tpr, thresholds = _sk_roc_curve(table.y_true, table.y_prob)
+        return [
+            {
+                "point_idx": float(idx),
+                "fpr": float(fpr_value),
+                "tpr": float(tpr_value),
+                "threshold": float(threshold),
+            }
+            for idx, (fpr_value, tpr_value, threshold) in enumerate(zip(fpr, tpr, thresholds))
+        ]
     thresholds = np.concatenate(([float("inf")], np.sort(np.unique(table.y_prob))[::-1]))
     n_pos = int((table.y_true == 1).sum())
     n_neg = int((table.y_true == 0).sum())
@@ -316,6 +363,7 @@ def write_summary_markdown(
         f"- Predictions CSV: `{predictions_csv}`",
         f"- Model: {metric_row['model']}",
         f"- Split: {metric_row['split']}",
+        f"- Metrics backend: {metric_row['metrics_backend']}",
         f"- N: {metric_row['n']} ({metric_row['n_negative']} negative, {metric_row['n_positive']} positive)",
         f"- Confusion matrix: TN={metric_row['tn']}, FP={metric_row['fp']}, FN={metric_row['fn']}, TP={metric_row['tp']}",
         "",
@@ -441,6 +489,7 @@ def main() -> None:
     metric_fields = [
         "model",
         "split",
+        "metrics_backend",
         "n",
         "n_negative",
         "n_positive",
@@ -485,6 +534,7 @@ def main() -> None:
         "predictions_csv": str(args.predictions_csv),
         "output_dir": str(output_dir),
         "model_name": args.model_name,
+        "metrics_backend": METRICS_BACKEND,
         "split": table.split,
         "source_rows": table.source_rows,
         "n_bootstrap": args.n_bootstrap,
