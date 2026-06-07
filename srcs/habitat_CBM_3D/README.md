@@ -30,8 +30,13 @@ python repo/srcs/habitat_CBM_3D/build_habitat_ucsf_3D.py \
   --manifest-csv /root/autodl-tmp/habitat_CBM/dataset/ucsf_pdgm_3d/manifest_ucsf_pdgm_3d.csv \
   --output-root /root/autodl-tmp/habitat_CBM/dataset/ucsf_pdgm_3d/habitat_masks \
   --selected-habitat h23 \
+  --kmeans-backend torch-cuda \
+  --zscore-std-rtol 1e-6 \
+  --num-workers 4 \
   --overwrite true
 ```
+
+`--kmeans-backend torch-cuda` runs the K-means distance update on CUDA matrix ops; for CPU-only parallel clustering, use `--kmeans-backend sklearn --num-workers N`. `--num-workers` parallelizes independent patients. If a case has constant ADC inside the tumor VOI, exclude that case from the current manifest instead of silently pretending a K-means partition exists.
 
 ```bash
 # 3) Extract radiomics proxies and concept proxy features

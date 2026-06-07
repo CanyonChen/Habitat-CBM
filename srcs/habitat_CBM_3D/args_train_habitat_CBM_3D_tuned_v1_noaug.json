@@ -1,0 +1,243 @@
+{
+  "_comment": "Habitat-CBM 3D tuned v1 no-augmentation config. Uses UCSF-PDGM h23 concept assets and MedicalNet-18 pretrained weights.",
+  "paths": {
+    "manifest_csv": "/root/autodl-tmp/habitat_CBM/dataset/ucsf_pdgm_3d/manifest_ucsf_pdgm_3d.csv",
+    "split_base_root": null,
+    "concept_label_csv": "/root/autodl-tmp/habitat_CBM/dataset/ucsf_pdgm_3d/concept_label/concept_labels.csv",
+    "concept_scaler_json": "/root/autodl-tmp/habitat_CBM/dataset/ucsf_pdgm_3d/concept_label/concept_scaler_stats.json",
+    "runs_root": "/root/autodl-tmp/habitat_CBM/results/habitat_CBM_3D_ucsf",
+    "results_root": "/root/autodl-tmp/habitat_CBM/results/habitat_CBM_3D_ucsf",
+    "checkpoint_root": null
+  },
+  "data": {
+    "_comment": "T1/T1c/T2/FLAIR are cropped with tumor_segmentation and loaded as [C,D,H,W].",
+    "modalities": ["t1", "t1ce", "t2", "t2flair"],
+    "require_voi": true,
+    "crop_with_voi": true,
+    "crop_margin": [4, 16, 16],
+    "target_shape": [32, 128, 128],
+    "intensity_norm": "zscore",
+    "cache_volumes": false
+  },
+  "model": {
+    "in_channels": 4,
+    "selected_concepts": ["C1", "C2", "C3", "C4", "C6"],
+    "n_concepts": 5,
+    "concept_hidden_dim": 256,
+    "label_hidden_dim": 32,
+    "concept_dropout_p": 0.25,
+    "label_dropout_p": 0.0,
+    "pretrain_path": "models/medicalnet_18.pth"
+  },
+  "train": {
+    "seed": 42,
+    "device": "cuda",
+    "batch_size": 1,
+    "num_workers": 4,
+    "early_stop_patience": 30,
+    "early_stop_min_delta": 0.001,
+    "patient_balanced_sampling": true,
+    "use_monai_augmentation": false,
+    "aug_affine_prob": 0.0,
+    "aug_rotate_deg": 7.5,
+    "aug_translate_px": 4.0,
+    "aug_scale_range": 0.08,
+    "aug_flip_prob": 0.0,
+    "aug_intensity_scale_prob": 0.0,
+    "aug_intensity_scale": 0.10,
+    "aug_intensity_shift_prob": 0.0,
+    "aug_intensity_shift": 0.05,
+    "aug_gaussian_noise_prob": 0.0,
+    "aug_gaussian_noise_std": 0.02,
+    "aug_gibbs_noise_prob": 0.0,
+    "aug_gibbs_noise_alpha": 0.3
+  },
+  "stages": {
+    "stage1": {
+      "epochs": 100,
+      "checkpoint_name": "stage1_best.pt",
+      "log_csv": "stage1_concept_log.csv",
+      "batch_size": 1,
+      "freeze_encoder_layers": ["conv1", "bn1", "layer1"],
+      "optimizer": {
+        "name": "adamw",
+        "lr": 0.00005,
+        "lr_encoder": 0.00001,
+        "lr_concept_head": 0.00005,
+        "weight_decay": 0.003,
+        "betas": [0.9, 0.999],
+        "eps": 1e-8,
+        "amsgrad": false
+      },
+      "scheduler": {
+        "enabled": true,
+        "name": "reduce_on_plateau",
+        "mode": "min",
+        "factor": 0.5,
+        "patience": 6,
+        "min_lr": 1e-7
+      },
+      "early_stop_patience": 30,
+      "early_stop_min_delta": 0.001
+    },
+    "stage2": {
+      "epochs": 80,
+      "checkpoint_name": "stage2_best.pt",
+      "log_csv": "stage2_label_head_log.csv",
+      "patient_level": true,
+      "batch_size": 16,
+      "monitor_metric": "label_loss",
+      "concept_noise_mode": "residual",
+      "concept_noise_std": 0.05,
+      "concept_noise_min_std": 0.015,
+      "concept_noise_max_std": 0.12,
+      "optimizer": {
+        "name": "adamw",
+        "lr": 0.001,
+        "lr_label_head": 0.001,
+        "weight_decay": 0.0001,
+        "betas": [0.9, 0.999],
+        "eps": 1e-8,
+        "amsgrad": false
+      },
+      "scheduler": {
+        "enabled": true,
+        "name": "reduce_on_plateau",
+        "mode": "min",
+        "factor": 0.5,
+        "patience": 5,
+        "min_lr": 1e-5
+      },
+      "label_loss": {
+        "use_pos_weight": true
+      },
+      "early_stop_patience": 25,
+      "early_stop_min_delta": 0.001
+    },
+    "stage3": {
+      "two_step_enabled": true,
+      "epochs": 50,
+      "batch_size": 1,
+      "label_loss": {
+        "use_pos_weight": false
+      },
+      "step_a": {
+        "epochs": 40,
+        "checkpoint_name": "stage3a_label_adapt_best.pt",
+        "log_csv": "stage3a_label_adapt_log.csv",
+        "joint_loss": {
+          "lambda_c": 0.0,
+          "lambda_y": 1.0
+        },
+        "concept_guard_enabled": false,
+        "optimizer": {
+          "name": "adamw",
+          "lr": 0.0003,
+          "lr_label_head": 0.0003,
+          "weight_decay": 0.0001,
+          "betas": [0.9, 0.999],
+          "eps": 1e-8,
+          "amsgrad": false
+        },
+        "scheduler": {
+          "enabled": true,
+          "name": "reduce_on_plateau",
+          "mode": "max",
+          "factor": 0.5,
+          "patience": 5,
+          "min_lr": 1e-6
+        },
+        "early_stop_patience": 20,
+        "early_stop_min_delta": 0.001
+      },
+      "step_b": {
+        "epochs": 80,
+        "checkpoint_name": "stage3_best.pt",
+        "log_csv": "stage3_joint_log.csv",
+        "freeze_encoder_layers": ["conv1", "bn1", "layer1", "layer2"],
+        "joint_loss": {
+          "lambda_c": 1.0,
+          "lambda_y": 1.0
+        },
+        "concept_guard_enabled": true,
+        "concept_guard_reference_loss": null,
+        "concept_guard_max_delta": 0.2,
+        "optimizer": {
+          "name": "adamw",
+          "lr": 0.00001,
+          "lr_encoder": 0.000002,
+          "lr_concept_head": 0.000006,
+          "lr_label_head": 0.00001,
+          "weight_decay": 0.003,
+          "betas": [0.9, 0.999],
+          "eps": 1e-8,
+          "amsgrad": false
+        },
+        "scheduler": {
+          "enabled": true,
+          "name": "reduce_on_plateau",
+          "mode": "max",
+          "factor": 0.5,
+          "patience": 6,
+          "min_lr": 1e-8
+        },
+        "early_stop_patience": 30,
+        "early_stop_min_delta": 0.001
+      }
+    }
+  },
+  "loss": {
+    "concept": {
+      "name": "smooth_l1",
+      "reduction": "mean",
+      "beta": 0.5
+    },
+    "label": {
+      "name": "bce_with_logits",
+      "reduction": "mean",
+      "use_pos_weight": true,
+      "manual_pos_weight": null,
+      "label_smoothing": 0.0
+    },
+    "joint": {
+      "lambda_c": 0.5,
+      "lambda_y": 1.0
+    }
+  },
+  "optimizer": {
+    "name": "adamw",
+    "lr": 0.00005,
+    "lr_encoder": 0.00001,
+    "lr_concept_head": 0.00005,
+    "lr_label_head": 0.0001,
+    "weight_decay": 0.01,
+    "betas": [0.9, 0.999],
+    "eps": 1e-8,
+    "amsgrad": false
+  },
+  "scheduler": {
+    "enabled": true,
+    "name": "reduce_on_plateau",
+    "mode": "max",
+    "factor": 0.5,
+    "patience": 5,
+    "min_lr": 1e-7
+  },
+  "eval": {
+    "threshold": 0.5,
+    "topk_pool": 0,
+    "include_splits": ["train", "val", "test"],
+    "export_png": true,
+    "figure_include_splits": ["train", "val", "test"],
+    "figure_dpi": 300
+  },
+  "intervention": {
+    "enable": false,
+    "budgets": [1, 2, 4, "all"],
+    "low_confidence_margin": 0.1
+  },
+  "logging": {
+    "run_id": "ucsf_h23_mednet18_tuned_v1_noaug_seed42",
+    "log_to_file": true
+  }
+}

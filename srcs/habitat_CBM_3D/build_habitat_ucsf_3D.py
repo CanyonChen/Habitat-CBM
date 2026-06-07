@@ -8,6 +8,7 @@ import argparse
 import json
 import shutil
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Mapping, Sequence, Tuple
 
@@ -33,8 +34,13 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-init", type=int, default=20)
     parser.add_argument("--max-iter", type=int, default=300)
+    parser.add_argument("--kmeans-backend", type=str, default="sklearn", choices=("sklearn", "torch-cuda", "numpy", "auto"))
+    parser.add_argument("--zscore-std-atol", type=float, default=0.0)
+    parser.add_argument("--zscore-std-rtol", type=float, default=1e-6)
+    parser.add_argument("--constant-adc-policy", type=str, default="fail", choices=("fail", "whole-tumor-selected"))
     parser.add_argument("--min-voi-voxels", type=int, default=32)
     parser.add_argument("--max-patients", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--overwrite", type=str2bool, default=False)
     return parser
 
@@ -47,12 +53,20 @@ def _load_nifti(path: Path) -> tuple[nib.spatialimages.SpatialImage, np.ndarray]
     return image, array
 
 
-def _zscore(values: np.ndarray) -> tuple[np.ndarray, float, float]:
+def _adc_stats(values: np.ndarray, std_atol: float, std_rtol: float) -> tuple[float, float, float]:
     mean = float(np.mean(values, dtype=np.float64))
     std = float(np.std(values, dtype=np.float64))
-    if not np.isfinite(mean) or not np.isfinite(std) or std <= 1e-8:
-        raise ValueError(f"ADC values have invalid mean/std: mean={mean}, std={std}")
-    return ((values - mean) / std).astype(np.float32), mean, std
+    max_abs = float(np.max(np.abs(values)))
+    scale = max(abs(mean), max_abs, np.finfo(np.float32).tiny)
+    min_std = max(float(std_atol), float(std_rtol) * scale)
+    return mean, std, min_std
+
+
+def _zscore(values: np.ndarray, std_atol: float, std_rtol: float) -> tuple[np.ndarray, float, float, float]:
+    mean, std, min_std = _adc_stats(values, std_atol=std_atol, std_rtol=std_rtol)
+    if not np.isfinite(mean) or not np.isfinite(std) or std <= min_std:
+        raise ValueError(f"ADC values have invalid mean/std: mean={mean}, std={std}, min_std={min_std}")
+    return ((values - mean) / std).astype(np.float32), mean, std, min_std
 
 
 def _fallback_kmeans_1d(values_z: np.ndarray, seed: int, max_iter: int) -> tuple[np.ndarray, np.ndarray, float, int, str]:
@@ -82,7 +96,86 @@ def _fallback_kmeans_1d(values_z: np.ndarray, seed: int, max_iter: int) -> tuple
     return labels, centers.astype(np.float32), inertia, n_iter, "numpy-1d"
 
 
-def _run_kmeans(values_z: np.ndarray, seed: int, n_init: int, max_iter: int) -> tuple[np.ndarray, np.ndarray, float, int, str]:
+def _torch_cuda_available() -> bool:
+    try:
+        import torch
+    except Exception:
+        return False
+    return bool(torch.cuda.is_available())
+
+
+def _torch_cuda_kmeans_1d(
+    values_z: np.ndarray,
+    seed: int,
+    n_init: int,
+    max_iter: int,
+) -> tuple[np.ndarray, np.ndarray, float, int, str]:
+    try:
+        import torch
+    except Exception as exc:
+        raise RuntimeError("torch-cuda K-means backend requires PyTorch.") from exc
+    if not torch.cuda.is_available():
+        raise RuntimeError("torch-cuda K-means backend requested, but CUDA is not available.")
+    if values_z.size < 3:
+        raise ValueError("Need at least 3 VOI voxels for k=3.")
+
+    device = torch.device("cuda")
+    x = torch.as_tensor(values_z.reshape(-1, 1), dtype=torch.float32, device=device)
+    x_flat = x.reshape(-1)
+    init_count = max(1, int(n_init))
+    max_iter = int(max_iter)
+
+    base_centers = np.percentile(values_z, [15.0, 50.0, 85.0]).astype(np.float32)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed))
+    centers = torch.as_tensor(base_centers, dtype=torch.float32, device=device).repeat(init_count, 1)
+    centers += torch.randn((init_count, 3), generator=generator, device=device) * 1e-4
+
+    labels = torch.zeros((init_count, x.shape[0]), dtype=torch.long, device=device)
+    n_iter = 0
+    x_batched = x.unsqueeze(0).expand(init_count, -1, -1)
+    for n_iter in range(1, max_iter + 1):
+        center_view = centers.reshape(init_count, 1, 3)
+        dist = x_batched.pow(2) + center_view.pow(2) - 2.0 * torch.matmul(x_batched, center_view)
+        labels = torch.argmin(dist, dim=2)
+        new_centers = centers.clone()
+        for init_idx in range(init_count):
+            init_dist = dist[init_idx]
+            for cluster_idx in range(3):
+                mask = labels[init_idx] == cluster_idx
+                if bool(mask.any()):
+                    new_centers[init_idx, cluster_idx] = x_flat[mask].mean()
+                else:
+                    farthest_idx = torch.argmax(torch.min(init_dist, dim=1).values)
+                    new_centers[init_idx, cluster_idx] = x_flat[farthest_idx]
+        if float(torch.max(torch.abs(new_centers - centers)).item()) <= 1e-5:
+            centers = new_centers
+            break
+        centers = new_centers
+
+    center_view = centers.reshape(init_count, 1, 3)
+    final_dist = x_batched.pow(2) + center_view.pow(2) - 2.0 * torch.matmul(x_batched, center_view)
+    final_labels = torch.argmin(final_dist, dim=2)
+    inertias = final_dist.gather(2, final_labels.unsqueeze(2)).sum(dim=(1, 2))
+    best_idx = int(torch.argmin(inertias).item())
+    return (
+        final_labels[best_idx].detach().cpu().numpy().astype(np.int64),
+        centers[best_idx].detach().cpu().numpy().astype(np.float32),
+        float(inertias[best_idx].item()),
+        n_iter,
+        "torch-cuda-cublas",
+    )
+
+
+def _run_kmeans(values_z: np.ndarray, seed: int, n_init: int, max_iter: int, backend: str) -> tuple[np.ndarray, np.ndarray, float, int, str]:
+    backend = backend.strip().lower()
+    if backend == "auto":
+        backend = "torch-cuda" if _torch_cuda_available() else "sklearn"
+    if backend == "torch-cuda":
+        return _torch_cuda_kmeans_1d(values_z, seed=seed, n_init=n_init, max_iter=max_iter)
+    if backend == "numpy":
+        return _fallback_kmeans_1d(values_z, seed=seed, max_iter=max_iter)
+
     x = values_z.reshape(-1, 1)
     if SklearnKMeans is not None:
         model = SklearnKMeans(
@@ -96,6 +189,8 @@ def _run_kmeans(values_z: np.ndarray, seed: int, n_init: int, max_iter: int) -> 
         labels = model.fit_predict(x).astype(np.int64)
         centers = np.asarray(model.cluster_centers_, dtype=np.float32).reshape(3)
         return labels, centers, float(model.inertia_), int(model.n_iter_), "sklearn"
+    if backend == "sklearn":
+        raise RuntimeError("sklearn K-means backend requested, but scikit-learn is not available.")
     return _fallback_kmeans_1d(values_z, seed=seed, max_iter=max_iter)
 
 
@@ -157,6 +252,10 @@ def _process_record(
     seed: int,
     n_init: int,
     max_iter: int,
+    kmeans_backend: str,
+    zscore_std_atol: float,
+    zscore_std_rtol: float,
+    constant_adc_policy: str,
     min_voi_voxels: int,
     overwrite: bool,
 ) -> Dict[str, object]:
@@ -186,19 +285,49 @@ def _process_record(
             f"{int(finite_mask.sum())}."
         )
     adc_values_finite = adc_values[finite_mask].astype(np.float32, copy=False)
-    values_z, adc_mean, adc_std = _zscore(adc_values_finite)
-    labels_raw, centers_z, inertia, n_iter, backend = _run_kmeans(
-        values_z,
-        seed=seed,
-        n_init=n_init,
-        max_iter=max_iter,
+    adc_mean, adc_std, zscore_min_std = _adc_stats(
+        adc_values_finite,
+        std_atol=zscore_std_atol,
+        std_rtol=zscore_std_rtol,
     )
-    labels_mapped, centers_mapped, counts_mapped = _map_labels_by_adc_center(labels_raw, adc_values_finite)
+    habitat_build_note = ""
+    if np.isfinite(adc_mean) and np.isfinite(adc_std) and adc_std <= zscore_min_std and constant_adc_policy == "whole-tumor-selected":
+        label_volume = np.zeros(adc.shape, dtype=np.uint8)
+        label_volume[voi] = 2
+        centers_z = np.zeros(3, dtype=np.float32)
+        inertia = 0.0
+        n_iter = 0
+        backend = "constant-adc-whole-tumor-fallback"
+        centers_mapped = {
+            "h1_adc_center": adc_mean,
+            "h2_adc_center": adc_mean,
+            "h3_adc_center": adc_mean,
+        }
+        counts_mapped = {
+            "h1_voxels": 0,
+            "h2_voxels": voi_count,
+            "h3_voxels": 0,
+        }
+        habitat_build_note = "constant_adc_in_voi; h2=whole_tumor; h23=whole_tumor"
+    else:
+        values_z, adc_mean, adc_std, zscore_min_std = _zscore(
+            adc_values_finite,
+            std_atol=zscore_std_atol,
+            std_rtol=zscore_std_rtol,
+        )
+        labels_raw, centers_z, inertia, n_iter, backend = _run_kmeans(
+            values_z,
+            seed=seed,
+            n_init=n_init,
+            max_iter=max_iter,
+            backend=kmeans_backend,
+        )
+        labels_mapped, centers_mapped, counts_mapped = _map_labels_by_adc_center(labels_raw, adc_values_finite)
 
-    flat_label_volume = np.zeros(voi_count, dtype=np.uint8)
-    flat_label_volume[finite_mask] = labels_mapped
-    label_volume = np.zeros(adc.shape, dtype=np.uint8)
-    label_volume[voi] = flat_label_volume
+        flat_label_volume = np.zeros(voi_count, dtype=np.uint8)
+        flat_label_volume[finite_mask] = labels_mapped
+        label_volume = np.zeros(adc.shape, dtype=np.uint8)
+        label_volume[voi] = flat_label_volume
     masks = _make_masks(label_volume, voi)
     for name, mask in masks.items():
         _save_mask(mask, adc_img, patient_out / f"{name}.nii.gz")
@@ -217,14 +346,47 @@ def _process_record(
         "selected_volume_ratio": float(selected_count / voi_count),
         "adc_mean_in_voi": adc_mean,
         "adc_std_in_voi": adc_std,
+        "zscore_min_std": zscore_min_std,
         "kmeans_backend": backend,
         "kmeans_inertia": inertia,
         "kmeans_iterations": n_iter,
         "kmeans_centers_z": json.dumps([float(item) for item in centers_z.tolist()]),
+        "habitat_build_note": habitat_build_note,
         **centers_mapped,
         **counts_mapped,
     }
     return row
+
+
+def _process_record_worker(args: tuple[object, Path, str, int, int, int, str, float, float, str, int, bool]) -> Dict[str, object]:
+    (
+        record,
+        output_root,
+        selected_habitat,
+        seed,
+        n_init,
+        max_iter,
+        kmeans_backend,
+        zscore_std_atol,
+        zscore_std_rtol,
+        constant_adc_policy,
+        min_voi_voxels,
+        overwrite,
+    ) = args
+    return _process_record(
+        record=record,
+        output_root=output_root,
+        selected_habitat=selected_habitat,
+        seed=seed,
+        n_init=n_init,
+        max_iter=max_iter,
+        kmeans_backend=kmeans_backend,
+        zscore_std_atol=zscore_std_atol,
+        zscore_std_rtol=zscore_std_rtol,
+        constant_adc_policy=constant_adc_policy,
+        min_voi_voxels=min_voi_voxels,
+        overwrite=overwrite,
+    )
 
 
 def main() -> None:
@@ -245,29 +407,66 @@ def main() -> None:
     output_root.mkdir(parents=True, exist_ok=True)
     qc_rows: List[Dict[str, object]] = []
     failure_rows: List[Dict[str, object]] = []
-    for record in records:
-        try:
-            qc_rows.append(
-                _process_record(
-                    record=record,
-                    output_root=output_root,
-                    selected_habitat=selected_habitat,
-                    seed=int(args.seed),
-                    n_init=int(args.n_init),
-                    max_iter=int(args.max_iter),
-                    min_voi_voxels=int(args.min_voi_voxels),
-                    overwrite=bool(args.overwrite),
+    worker_args = [
+        (
+            record,
+            output_root,
+            selected_habitat,
+            int(args.seed),
+            int(args.n_init),
+            int(args.max_iter),
+            str(args.kmeans_backend),
+            float(args.zscore_std_atol),
+            float(args.zscore_std_rtol),
+            str(args.constant_adc_policy),
+            int(args.min_voi_voxels),
+            bool(args.overwrite),
+        )
+        for record in records
+    ]
+    num_workers = max(1, int(args.num_workers))
+    if num_workers == 1:
+        for item in worker_args:
+            record = item[0]
+            try:
+                qc_rows.append(_process_record_worker(item))
+            except Exception as exc:
+                failure_rows.append(
+                    {
+                        "patient_id": record.patient_id,
+                        "split": record.split,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
                 )
-            )
-        except Exception as exc:
-            failure_rows.append(
-                {
-                    "patient_id": record.patient_id,
-                    "split": record.split,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                }
-            )
+    else:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            future_to_record = {executor.submit(_process_record_worker, item): item[0] for item in worker_args}
+            for completed, future in enumerate(as_completed(future_to_record), start=1):
+                record = future_to_record[future]
+                try:
+                    qc_rows.append(future.result())
+                except Exception as exc:
+                    failure_rows.append(
+                        {
+                            "patient_id": record.patient_id,
+                            "split": record.split,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }
+                    )
+                if completed % 25 == 0 or completed == len(future_to_record):
+                    print(
+                        f"[progress] completed={completed}/{len(future_to_record)} "
+                        f"processed={len(qc_rows)} failed={len(failure_rows)}",
+                        flush=True,
+                    )
+
+    qc_rows = sorted(qc_rows, key=lambda item: (str(item["split"]), str(item["patient_id"])))
+    failure_rows = sorted(
+        failure_rows,
+        key=lambda item: (str(item["split"]), str(item["patient_id"]), str(item["error_type"])),
+    )
 
     qc_path = output_root / "habitat_qc_ucsf_pdgm_3d.csv"
     fail_path = output_root / "habitat_failures_ucsf_pdgm_3d.csv"
@@ -284,10 +483,12 @@ def main() -> None:
         "selected_volume_ratio",
         "adc_mean_in_voi",
         "adc_std_in_voi",
+        "zscore_min_std",
         "kmeans_backend",
         "kmeans_inertia",
         "kmeans_iterations",
         "kmeans_centers_z",
+        "habitat_build_note",
         "h1_adc_center",
         "h2_adc_center",
         "h3_adc_center",
@@ -305,6 +506,8 @@ def main() -> None:
                 "manifest_csv": str(args.manifest_csv),
                 "output_root": str(output_root),
                 "selected_habitat": selected_habitat,
+                "kmeans_backend": str(args.kmeans_backend),
+                "constant_adc_policy": str(args.constant_adc_policy),
                 "processed": len(qc_rows),
                 "failed": len(failure_rows),
             },
