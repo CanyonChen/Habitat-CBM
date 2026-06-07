@@ -229,7 +229,7 @@
     "threshold": 0.5,
     "topk_pool": 0,
     "include_splits": ["train", "val", "test"],
-    "export_png": true,
+    "export_png": false,
     "figure_include_splits": ["train", "val", "test"],
     "figure_dpi": 300
   },
