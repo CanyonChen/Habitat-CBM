@@ -80,7 +80,8 @@ def _resolve_run_id(run_id: str | None) -> str:
 
 
 def build_eval_datasets_and_loaders(
-    split_base_root: Path,
+    split_base_root: Path | None,
+    manifest_csv: Path | None,
     concept_label_csv: Path,
     concept_scaler_json: Path,
     data_cfg: Mapping[str, object],
@@ -95,6 +96,7 @@ def build_eval_datasets_and_loaders(
     )
     datasets = build_habitat_cbm_3d_datasets(
         split_base_root=split_base_root,
+        manifest_csv=manifest_csv,
         modalities=tuple(data_cfg.get("modalities", DEFAULT_3D_MODALITIES)),
         require_voi=bool(data_cfg.get("require_voi", True)),
         crop_with_voi=bool(data_cfg.get("crop_with_voi", True)),
@@ -251,7 +253,10 @@ def main() -> None:
         model_cfg.get("selected_concepts", checkpoint_model_cfg.get("selected_concepts"))
     )
     concept_columns = concept_names_to_columns(selected_concept_names)
-    split_base_root = Path(paths_cfg.get("split_base_root", REPO_ROOT.parent / "dataset" / "splited_data"))
+    manifest_csv = Path(paths_cfg["manifest_csv"]) if paths_cfg.get("manifest_csv") else None
+    split_base_root = Path(paths_cfg["split_base_root"]) if paths_cfg.get("split_base_root") else None
+    if manifest_csv is None and split_base_root is None:
+        split_base_root = REPO_ROOT.parent / "dataset" / "splited_data"
     concept_label_csv = Path(paths_cfg.get("concept_label_csv", REPO_ROOT.parent / "dataset" / "concept_label" / "concept_labels.csv"))
     concept_scaler_json = Path(paths_cfg.get("concept_scaler_json", REPO_ROOT.parent / "dataset" / "concept_label" / "concept_scaler_stats.json"))
 
@@ -260,6 +265,7 @@ def main() -> None:
     scaler = load_concept_scaler(concept_scaler_json, concept_names=selected_concept_names)
     _, loaders = build_eval_datasets_and_loaders(
         split_base_root=split_base_root,
+        manifest_csv=manifest_csv,
         concept_label_csv=concept_label_csv,
         concept_scaler_json=concept_scaler_json,
         data_cfg=data_cfg,

@@ -88,10 +88,12 @@ def _validate_config(cfg: Mapping[str, object]) -> None:
     paths_cfg = cfg["paths"]
     if not isinstance(paths_cfg, Mapping):
         raise ValueError("Config 'paths' must be object")
-    required_paths = {"split_base_root", "concept_label_csv", "concept_scaler_json", "runs_root", "results_root"}
+    required_paths = {"concept_label_csv", "concept_scaler_json", "runs_root", "results_root"}
     missing_paths = sorted(required_paths - set(paths_cfg.keys()))
     if missing_paths:
         raise ValueError(f"Config paths missing keys: {missing_paths}")
+    if "manifest_csv" not in paths_cfg and "split_base_root" not in paths_cfg:
+        raise ValueError("Config paths must include either manifest_csv or split_base_root.")
 
 
 def _parse_int_triple(
@@ -196,7 +198,8 @@ def main() -> None:
     _save_json(cfg_snapshot_path, cfg)
     device = torch.device(str(train_cfg.get("device", "cpu")))
 
-    split_base_root = Path(paths_cfg["split_base_root"])
+    manifest_csv = Path(paths_cfg["manifest_csv"]) if paths_cfg.get("manifest_csv") else None
+    split_base_root = Path(paths_cfg["split_base_root"]) if paths_cfg.get("split_base_root") else None
     concept_label_csv = Path(paths_cfg["concept_label_csv"])
     concept_scaler_json = Path(paths_cfg["concept_scaler_json"])
     selected_concept_names = resolve_concept_names(model_cfg.get("selected_concepts"))
@@ -213,6 +216,7 @@ def main() -> None:
     transform_map = _build_transforms(data_cfg=data_cfg, train_cfg=train_cfg)
     datasets = build_habitat_cbm_3d_datasets(
         split_base_root=split_base_root,
+        manifest_csv=manifest_csv,
         modalities=modalities,
         require_voi=bool(data_cfg.get("require_voi", True)),
         crop_with_voi=bool(data_cfg.get("crop_with_voi", True)),
@@ -560,7 +564,8 @@ def main() -> None:
             "config_snapshot": str(cfg_snapshot_path),
         },
         "data": {
-            "split_base_root": str(split_base_root),
+            "manifest_csv": str(manifest_csv) if manifest_csv is not None else None,
+            "split_base_root": str(split_base_root) if split_base_root is not None else None,
             "concept_label_csv": str(concept_label_csv),
             "concept_scaler_json": str(concept_scaler_json),
             "input_channels": in_channels,

@@ -1,15 +1,16 @@
 {
-  "_comment": "Habitat-CBM 3D 三阶段训练配置。默认使用 4 模态 3D volume，VOI 只用于裁剪，不作为输入通道。",
+  "_comment": "Habitat-CBM 3D 三阶段训练配置。默认使用 UCSF-PDGM manifest；模型输入为 T1/T1c/T2/FLAIR 四模态，ADC/tumor_segmentation 仅用于上游 habitat/radiomics/concept 资产。",
   "paths": {
-    "split_base_root": "/root/autodl-tmp/habitat_CBM/dataset/splited_data",
-    "concept_label_csv": "/root/autodl-tmp/habitat_CBM/dataset/concept_label/concept_labels.csv",
-    "concept_scaler_json": "/root/autodl-tmp/habitat_CBM/dataset/concept_label/concept_scaler_stats.json",
-    "runs_root": "/root/autodl-tmp/habitat_CBM/results/habitat_CBM_3D",
-    "results_root": "/root/autodl-tmp/habitat_CBM/results/habitat_CBM_3D",
+    "manifest_csv": "/root/autodl-tmp/habitat_CBM/dataset/ucsf_pdgm_3d/manifest_ucsf_pdgm_3d.csv",
+    "split_base_root": null,
+    "concept_label_csv": "/root/autodl-tmp/habitat_CBM/dataset/ucsf_pdgm_3d/concept_label/concept_labels.csv",
+    "concept_scaler_json": "/root/autodl-tmp/habitat_CBM/dataset/ucsf_pdgm_3d/concept_label/concept_scaler_stats.json",
+    "runs_root": "/root/autodl-tmp/habitat_CBM/results/habitat_CBM_3D_ucsf",
+    "results_root": "/root/autodl-tmp/habitat_CBM/results/habitat_CBM_3D_ucsf",
     "checkpoint_root": null
   },
   "data": {
-    "_comment": "NIfTI 数组按 [H,W,D] 读取，裁剪后转为模型输入 [C,D,H,W]。",
+    "_comment": "Manifest 中 T1/T1c/T2/FLAIR 按 [H,W,D] 读取，使用 tumor_segmentation 裁剪后转为模型输入 [C,D,H,W]。",
     "modalities": ["t1", "t1ce", "t2", "t2flair"],
     "require_voi": true,
     "crop_with_voi": true,
@@ -236,4 +237,3 @@
     "log_to_file": false
   }
 }
-

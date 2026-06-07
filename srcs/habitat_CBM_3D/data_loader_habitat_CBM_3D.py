@@ -42,6 +42,9 @@ from srcs.data_loader_habitat_CBM import (  # noqa: E402
     load_concept_scaler,
     resolve_concept_names,
 )
+from srcs.habitat_CBM_3D.ucsf_pdgm_3d_utils import (  # noqa: E402
+    read_manifest_records,
+)
 
 DEFAULT_3D_MODALITIES = ("t1", "t1ce", "t2", "t2flair")
 DEFAULT_3D_TARGET_SHAPE = (32, 128, 128)  # [D,H,W]
@@ -92,7 +95,9 @@ class HabitatIDHVolumeDataset(Dataset):
 
     def __init__(
         self,
-        split_root: str | Path,
+        split_root: str | Path | None = None,
+        manifest_csv: str | Path | None = None,
+        split_name: str | None = None,
         modalities: Sequence[str] = DEFAULT_3D_MODALITIES,
         require_voi: bool = True,
         crop_with_voi: bool = True,
@@ -105,7 +110,17 @@ class HabitatIDHVolumeDataset(Dataset):
         concept_scaler_json: str | Path | None = None,
         concept_columns: Sequence[str] = DEFAULT_CONCEPT_COLUMNS,
     ) -> None:
-        self.split_root = Path(split_root)
+        self.split_root = Path(split_root) if split_root is not None else None
+        self.manifest_csv = Path(manifest_csv) if manifest_csv is not None else None
+        self.split_name = (
+            str(split_name).strip().lower()
+            if split_name is not None
+            else (self.split_root.name.strip().lower() if self.split_root is not None else None)
+        )
+        if self.split_root is None and self.manifest_csv is None:
+            raise ValueError("Either split_root or manifest_csv must be provided.")
+        if self.manifest_csv is not None and self.split_name not in {"train", "val", "test"}:
+            raise ValueError("split_name must be one of train/val/test when manifest_csv is used.")
         self.modalities = tuple(str(item).strip().lower() for item in modalities if str(item).strip())
         if not self.modalities:
             raise ValueError("modalities must not be empty.")
@@ -151,6 +166,10 @@ class HabitatIDHVolumeDataset(Dataset):
         return len(self.concept_columns)
 
     def _build_patient_cases(self) -> Dict[str, PatientCase]:
+        if self.manifest_csv is not None:
+            return self._build_patient_cases_from_manifest()
+        if self.split_root is None:
+            raise RuntimeError("split_root is required for legacy directory mode.")
         patient_dir_map = discover_patient_dirs(self.split_root)
         patient_cases: Dict[str, PatientCase] = {}
         for patient_id, entry in sorted(patient_dir_map.items()):
@@ -167,10 +186,40 @@ class HabitatIDHVolumeDataset(Dataset):
             )
         return patient_cases
 
+    def _build_patient_cases_from_manifest(self) -> Dict[str, PatientCase]:
+        if self.manifest_csv is None or self.split_name is None:
+            raise RuntimeError("manifest_csv and split_name are required for manifest mode.")
+        records = read_manifest_records(self.manifest_csv, split=self.split_name)
+        if not records:
+            raise ValueError(f"No records found for split={self.split_name} in manifest {self.manifest_csv}.")
+        patient_cases: Dict[str, PatientCase] = {}
+        for record in records:
+            modality_paths = {}
+            for modality in self.modalities:
+                if modality not in record.paths:
+                    raise KeyError(f"Manifest for patient {record.patient_id} has no modality path: {modality}")
+                path = record.paths[modality]
+                if not path.is_file():
+                    raise FileNotFoundError(f"Missing modality file for patient {record.patient_id}: {path}")
+                modality_paths[modality] = path
+            voi_path = record.paths["tumor_seg"] if self.require_voi else None
+            if voi_path is not None and not voi_path.is_file():
+                raise FileNotFoundError(f"Missing tumor segmentation for patient {record.patient_id}: {voi_path}")
+            patient_cases[record.patient_id] = PatientCase(
+                patient_id=record.patient_id,
+                label_name=record.label_name,
+                label_id=int(record.y_true),
+                modality_paths=modality_paths,
+                voi_path=voi_path,
+            )
+        return patient_cases
+
     def _validate_concept_alignment(self) -> None:
         if self._concept_scaler is None:
             raise RuntimeError("Concept scaler is not initialized.")
-        expected_split = self.split_root.name.strip().lower()
+        if self.split_name is None:
+            raise RuntimeError("Dataset split name is not initialized.")
+        expected_split = self.split_name
         if self._concept_scaler.mean.shape[0] != self.concept_dim:
             raise ValueError(
                 "Concept dimension mismatch between concept_columns and scaler stats: "
@@ -299,7 +348,7 @@ class HabitatIDHVolumeDataset(Dataset):
         if self.return_metadata:
             output["paths"] = {
                 **{key: str(value) for key, value in case.modality_paths.items()},
-                **({"voi": str(case.voi_path)} if case.voi_path is not None else {}),
+                **({"voi": str(case.voi_path), "tumor_seg": str(case.voi_path)} if case.voi_path is not None else {}),
             }
         return output
 
@@ -307,7 +356,9 @@ class HabitatIDHVolumeDataset(Dataset):
         patient_count = len(self.patient_cases)
         mutant_count = sum(case.label_id == 1 for case in self.patient_cases.values())
         return {
-            "split_root": str(self.split_root),
+            "split_root": str(self.split_root) if self.split_root is not None else None,
+            "manifest_csv": str(self.manifest_csv) if self.manifest_csv is not None else None,
+            "split_name": self.split_name,
             "patient_count": patient_count,
             "sample_count": len(self),
             "modalities": list(self.modalities),
@@ -365,7 +416,8 @@ def build_patient_balanced_sampler(dataset: HabitatIDHVolumeDataset) -> Weighted
 
 
 def build_habitat_cbm_3d_datasets(
-    split_base_root: str | Path,
+    split_base_root: str | Path | None = None,
+    manifest_csv: str | Path | None = None,
     modalities: Sequence[str] = DEFAULT_3D_MODALITIES,
     require_voi: bool = True,
     crop_with_voi: bool = True,
@@ -377,15 +429,23 @@ def build_habitat_cbm_3d_datasets(
     concept_columns: Sequence[str] | None = None,
     transform_map: Optional[Mapping[str, object]] = None,
 ) -> Dict[str, HabitatIDHVolumeDataset]:
-    base_root = Path(split_base_root)
+    base_root = Path(split_base_root) if split_base_root is not None else None
+    manifest_path = Path(manifest_csv) if manifest_csv is not None else None
+    if base_root is None and manifest_path is None:
+        raise ValueError("Either split_base_root or manifest_csv must be provided.")
     datasets: Dict[str, HabitatIDHVolumeDataset] = {}
     for split in ("train", "val", "test"):
-        split_root = base_root / split
-        if not split_root.is_dir():
-            raise FileNotFoundError(f"Missing split directory: {split_root}")
+        split_root = None
+        if manifest_path is None:
+            assert base_root is not None
+            split_root = base_root / split
+            if not split_root.is_dir():
+                raise FileNotFoundError(f"Missing split directory: {split_root}")
         transform = transform_map[split] if transform_map and split in transform_map else None
         datasets[split] = HabitatIDHVolumeDataset(
             split_root=split_root,
+            manifest_csv=manifest_path,
+            split_name=split,
             modalities=modalities,
             require_voi=require_voi,
             crop_with_voi=crop_with_voi,
@@ -437,7 +497,9 @@ def build_habitat_cbm_3d_dataloaders(
 
 def _build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Habitat-CBM 3D data loader debug CLI.")
-    parser.add_argument("--split-root", type=Path, required=True)
+    parser.add_argument("--split-root", type=Path, default=None)
+    parser.add_argument("--manifest-csv", type=Path, default=None)
+    parser.add_argument("--split", type=str, default="train", choices=("train", "val", "test"))
     parser.add_argument("--modalities", type=str, default=",".join(DEFAULT_3D_MODALITIES))
     parser.add_argument("--require-voi", type=str2bool, default=True)
     parser.add_argument("--crop-with-voi", type=str2bool, default=True)
@@ -456,6 +518,8 @@ def _main() -> None:
     selected_concepts = resolve_concept_names(args.selected_concepts) if args.selected_concepts is not None else DEFAULT_CONCEPT_NAMES
     dataset = HabitatIDHVolumeDataset(
         split_root=args.split_root,
+        manifest_csv=args.manifest_csv,
+        split_name=args.split if args.manifest_csv is not None else None,
         modalities=tuple(item.strip().lower() for item in args.modalities.split(",") if item.strip()),
         require_voi=args.require_voi,
         crop_with_voi=args.crop_with_voi,
