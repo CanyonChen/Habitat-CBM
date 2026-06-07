@@ -80,6 +80,15 @@ def _load_json(path: Path) -> Dict[str, object]:
     return payload
 
 
+def _resolve_repo_relative_path(value: object) -> Optional[Path]:
+    if value in (None, ""):
+        return None
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path
+
+
 def _validate_config(cfg: Mapping[str, object]) -> None:
     required_sections = {"paths", "data", "model", "train", "eval", "intervention", "logging"}
     missing = sorted(required_sections - set(cfg.keys()))
@@ -251,8 +260,8 @@ def main() -> None:
             f"model.in_channels must equal len(data.modalities)={expected_channels}, got {in_channels}."
         )
     concept_dropout_p, label_dropout_p = _resolve_model_dropouts(model_cfg)
-    pretrain_path = model_cfg.get("pretrain_path", None)
-    pretrain_path = None if pretrain_path in (None, "") else str(pretrain_path)
+    resolved_pretrain_path = _resolve_repo_relative_path(model_cfg.get("pretrain_path", None))
+    pretrain_path = None if resolved_pretrain_path is None else str(resolved_pretrain_path)
 
     model = HabitatCBM3D(
         in_channels=in_channels,

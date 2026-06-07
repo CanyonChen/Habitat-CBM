@@ -39,3 +39,7 @@ Thumbs.db
 
 # Concept Bottleneck
 concept_bottleneck/
+
+# Checkpoints
+*.pth
+*.ckpt

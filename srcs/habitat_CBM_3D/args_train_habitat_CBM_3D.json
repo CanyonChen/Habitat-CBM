@@ -27,7 +27,7 @@
     "label_hidden_dim": 32,
     "concept_dropout_p": 0.4,
     "label_dropout_p": 0.0,
-    "pretrain_path": null
+    "pretrain_path": "models/medicalnet_18.pth"
   },
   "train": {
     "seed": 42,
