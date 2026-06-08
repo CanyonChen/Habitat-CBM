@@ -522,10 +522,18 @@ def main() -> None:
     stage3_ckpt = stage_checkpoint_paths.get("stage3", checkpoint_root / "stage3_best.pt")
     _load_checkpoint_model_only(model, stage3_ckpt, device=device)
 
+    eval_dataloaders = build_habitat_cbm_3d_dataloaders(
+        datasets=datasets,
+        batch_size=int(train_cfg.get("batch_size", 1)),
+        num_workers=int(train_cfg.get("num_workers", 2)),
+        train_shuffle=False,
+        patient_balanced_sampling=False,
+    )
+
     print("[eval] Computing optimal threshold via Youden Index on val set ...")
     val_y_true, val_y_prob = collect_val_patient_probs(
         model=model,
-        val_loader=dataloaders["val"],
+        val_loader=eval_dataloaders["val"],
         device=device,
         topk_pool=topk_pool,
         threshold=threshold,
@@ -540,7 +548,7 @@ def main() -> None:
     figure_include_splits = tuple(eval_cfg.get("figure_include_splits", include_splits))
     exported = run_full_evaluation(
         model=model,
-        dataloaders=dataloaders,
+        dataloaders=eval_dataloaders,
         scaler=scaler,
         output_dir=result_dir,
         run_id=run_id,
