@@ -105,6 +105,54 @@ python repo/srcs/habitat_CBM_3D/intervene_habitat_cbm_3D.py \
   --split test
 ```
 
+## Result Diagnostics And v4 Experiments
+
+All diagnostic scripts write CSV/JSON/Markdown outputs before optional figures.
+Use the completed no-augmentation run as E1:
+
+```bash
+RUN_ID=ucsf_h23_mednet18_tuned_v3_noaug_b8_ep100_es10_seed42_20260607_235728
+RUN_DIR=/root/autodl-tmp/habitat_CBM/results/habitat_CBM_3D/${RUN_ID}
+
+python repo/srcs/habitat_CBM_3D/analyze_habitat_cbm_3d_results.py \
+  --run-dir ${RUN_DIR} \
+  --run-id ${RUN_ID} \
+  --export-plots
+```
+
+This exports threshold sweeps, calibration bins, probability histograms, and
+error-case tables to `${RUN_DIR}/diagnostics/e1_baseline/`. Oracle Youden
+thresholds are diagnostic only; formal results should keep the threshold learned
+from the internal validation split.
+
+To inspect internal/external domain differences without inference:
+
+```bash
+python repo/srcs/habitat_CBM_3D/inspect_habitat_cbm_3d_domain_shift.py \
+  --config repo/srcs/habitat_CBM_3D/args_train_habitat_CBM_3D_tuned_v3_noaug_b8_ep100_es10.json \
+  --external-split-root /root/autodl-tmp/habitat_CBM/dataset/splited_data \
+  --output-dir ${RUN_DIR}/diagnostics/domain_shift \
+  --export-plots
+```
+
+For E2, train the source-only MONAI augmentation configuration:
+
+```bash
+RUN_ID=ucsf_h23_mednet18_tuned_v4_monai_aug_b8_ep100_es10_seed42_$(date +%Y%m%d_%H%M%S)
+
+python -u repo/srcs/habitat_CBM_3D/train_habitat_CBM_3D.py \
+  --config repo/srcs/habitat_CBM_3D/args_train_habitat_CBM_3D_tuned_v4_monai_aug_b8_ep100_es10.json \
+  --run-id ${RUN_ID} \
+  --output-root /root/autodl-tmp/habitat_CBM/results/habitat_CBM_3D \
+  --device cuda
+```
+
+After E2 training, run concept validation, CBM-only statistics, external
+classification-only validation, and `analyze_habitat_cbm_3d_results.py` on the
+new run directory. E3 is the threshold/calibration report produced from those
+saved prediction CSVs; external oracle thresholds must remain labeled as
+post-hoc diagnostics.
+
 ## Smoke-Test Tips
 
 - Use `--max-patients 2` on habitat/radiomics scripts for quick checks.
